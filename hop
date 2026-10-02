@@ -17,6 +17,7 @@ HOME_REGION=${HOP_HOME_REGION:-us-east-1}
 SG_NAME=hop
 WG_PORT=41641
 TS_TOKEN=
+ZONE_TYPE=
 
 export AWS_PAGER=
 export AWS_DEFAULT_OUTPUT=json
@@ -34,11 +35,11 @@ usage() {
   cat <<EOF
 Usage: hop <command>
 
-  up <place> [--ttl HOURS]    launch an exit node in a region or Local Zone and route this Mac through it
+  up <place> [--ttl HOURS]    launch an exit node in a region or zone and route this Mac through it
   down [place]                stop using and destroy the nodes in that region, or every node
   status [--json]             list running nodes and which one is in use
   regions                     list the regions this AWS account can launch in
-  zones                       list the Local Zones under those regions
+  zones                       list the Local and Wavelength Zones under those regions
   doctor                      check tools, credentials and Tailscale access
 
 Settings are read from $CONFIG:
@@ -128,7 +129,7 @@ ts_release() {
 }
 
 is_zone() {
-  [[ $1 =~ ^[a-z]+-[a-z]+-[0-9]+-[a-z]+-[0-9]+[a-z]$ ]]
+  [[ $1 == *-*-*-* ]]
 }
 
 region_of() {
@@ -144,16 +145,23 @@ enabled_regions() {
 }
 
 scan_region() {
-  local region=$1 instances sg subnets
+  local region=$1 instances sg subnets rtbs cagws
   instances=$(aws_ ec2 describe-instances --region "$region" \
     --filters Name=tag-key,Values=hop Name=instance-state-name,Values=pending,running \
-    --query 'Reservations[].Instances[].{id:InstanceId,ip:PublicIpAddress,type:InstanceType,launched:LaunchTime,zone:Placement.AvailabilityZone,host:Tags[?Key==`hop`]|[0].Value}')
+    --query 'Reservations[].Instances[].{id:InstanceId,ip:PublicIpAddress||NetworkInterfaces[0].Association.CarrierIp,type:InstanceType,launched:LaunchTime,zone:Placement.AvailabilityZone,host:Tags[?Key==`hop`]|[0].Value}')
   sg=$(aws_ ec2 describe-security-groups --region "$region" --filters "Name=group-name,Values=$SG_NAME" \
     --query 'SecurityGroups[0].GroupId' --output text)
   subnets=$(aws_ ec2 describe-subnets --region "$region" --filters Name=tag-key,Values=hop \
     --query 'Subnets[].SubnetId')
-  jq -n --arg region "$region" --arg sg "$sg" --argjson instances "$instances" --argjson subnets "$subnets" \
-    '{region: $region, sg: (if $sg == "None" then null else $sg end), subnets: $subnets, instances: $instances}'
+  rtbs=$(aws_ ec2 describe-route-tables --region "$region" --filters Name=tag-key,Values=hop \
+    --query 'RouteTables[].RouteTableId')
+  cagws=$(aws_ ec2 describe-carrier-gateways --region "$region" \
+    --filters Name=tag-key,Values=hop Name=state,Values=pending,available \
+    --query 'CarrierGateways[].CarrierGatewayId' 2>/dev/null) || cagws='[]'
+  jq -n --arg region "$region" --arg sg "$sg" --argjson instances "$instances" \
+    --argjson subnets "$subnets" --argjson rtbs "$rtbs" --argjson cagws "$cagws" \
+    '{region: $region, sg: (if $sg == "None" then null else $sg end), subnets: $subnets, rtbs: $rtbs, cagws: $cagws,
+      instances: $instances}'
 }
 
 scan() {
@@ -185,17 +193,16 @@ default_vpc() {
 
 ensure_zone() {
   local region=$1 zone=$2 status group waited=0
-  read -r status group <<<"$(aws_ ec2 describe-availability-zones --region "$region" --all-availability-zones \
-    --filters "Name=zone-name,Values=$zone" Name=zone-type,Values=local-zone \
-    --query 'AvailabilityZones[0].[OptInStatus,GroupName]' --output text)"
-  [[ $status != None ]] || die "$zone is not a Local Zone of $region; see 'hop zones'"
+  read -r status group ZONE_TYPE <<<"$(aws_ ec2 describe-availability-zones --region "$region" --all-availability-zones \
+    --filters "Name=zone-name,Values=$zone" Name=zone-type,Values=local-zone,wavelength-zone \
+    --query 'AvailabilityZones[0].[OptInStatus,GroupName,ZoneType]' --output text)"
+  [[ $status != None ]] || die "$zone is not a Local or Wavelength Zone of $region; see 'hop zones'"
   [[ $status == not-opted-in ]] || return 0
   aws_ ec2 modify-availability-zone-group --region "$region" --group-name "$group" --opt-in-status opted-in >/dev/null
-  log "enabled Local Zone group $group on the account; this takes a few minutes the first time"
+  log "enabled zone group $group on the account; this takes a few minutes the first time"
   while ((waited < ZONE_TIMEOUT)); do
-    read -r status group <<<"$(aws_ ec2 describe-availability-zones --region "$region" --all-availability-zones \
-      --filters "Name=zone-name,Values=$zone" Name=zone-type,Values=local-zone \
-      --query 'AvailabilityZones[0].[OptInStatus,GroupName]' --output text)"
+    status=$(aws_ ec2 describe-availability-zones --region "$region" --all-availability-zones \
+      --filters "Name=zone-name,Values=$zone" --query 'AvailabilityZones[0].OptInStatus' --output text | cut -f1)
     [[ $status == opted-in ]] && return 0
     sleep "$POLL_INTERVAL"
     waited=$((waited + POLL_INTERVAL))
@@ -217,8 +224,31 @@ ensure_subnet() {
       subnet=None
     done
     [[ $subnet != None ]] || die "could not create a subnet for $zone in $vpc"
+    [[ $ZONE_TYPE != wavelength-zone ]] || route_via_carrier "$region" "$vpc" "$subnet"
   fi
   echo "$subnet"
+}
+
+route_via_carrier() {
+  local region=$1 vpc=$2 subnet=$3 cagw rtb tries=0
+  cagw=$(aws_ ec2 describe-carrier-gateways --region "$region" \
+    --filters "Name=vpc-id,Values=$vpc" Name=state,Values=pending,available \
+    --query 'CarrierGateways[0].CarrierGatewayId' --output text)
+  if [[ $cagw == None ]]; then
+    cagw=$(aws_ ec2 create-carrier-gateway --region "$region" --vpc-id "$vpc" \
+      --tag-specifications "ResourceType=carrier-gateway,Tags=[{Key=hop,Value=cagw}]" \
+      --query CarrierGateway.CarrierGatewayId --output text)
+  fi
+  rtb=$(aws_ ec2 create-route-table --region "$region" --vpc-id "$vpc" \
+    --tag-specifications "ResourceType=route-table,Tags=[{Key=hop,Value=rtb}]" \
+    --query RouteTable.RouteTableId --output text)
+  until aws_ ec2 create-route --region "$region" --route-table-id "$rtb" \
+    --destination-cidr-block 0.0.0.0/0 --carrier-gateway-id "$cagw" >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    ((tries < 12)) || die "could not route $subnet through carrier gateway $cagw"
+    sleep "$POLL_INTERVAL"
+  done
+  aws_ ec2 associate-route-table --region "$region" --route-table-id "$rtb" --subnet-id "$subnet" >/dev/null
 }
 
 ensure_sg() {
@@ -277,7 +307,7 @@ EOF
 }
 
 launch() {
-  local region=$1 ttl=$2 host=$3 zone=$4 sg spec specs type arch key file id='' vpc cidr subnet placement
+  local region=$1 ttl=$2 host=$3 zone=$4 sg spec specs type arch key file id='' vpc cidr subnet placement address
   [[ -z $zone ]] || ensure_zone "$region" "$zone"
   specs=$(pick_types "$region" "$zone")
   key=$(ts_mint_key | jq -r '.key // empty') || true
@@ -287,7 +317,9 @@ launch() {
   sg=$(ensure_sg "$region" "$vpc")
   if [[ -n $zone ]]; then
     subnet=$(ensure_subnet "$region" "$zone" "$vpc" "$cidr")
-    placement=(--network-interfaces "DeviceIndex=0,SubnetId=$subnet,Groups=$sg,AssociatePublicIpAddress=true"
+    address=AssociatePublicIpAddress
+    [[ $ZONE_TYPE != wavelength-zone ]] || address=AssociateCarrierIpAddress
+    placement=(--network-interfaces "DeviceIndex=0,SubnetId=$subnet,Groups=$sg,$address=true"
       --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeType=gp2}")
   else
     placement=(--security-group-ids "$sg")
@@ -352,8 +384,19 @@ verify_egress() {
   return 1
 }
 
+delete_each() {
+  local region=$1 entry=$2 key=$3 kind=$4 flag=$5 id
+  for id in $(jq -r --arg key "$key" '.[$key][]' <<<"$entry"); do
+    if aws_ ec2 "delete-$kind" --region "$region" "--$flag" "$id" >/dev/null; then
+      log "deleted $kind $id in $region"
+    else
+      log "hop: could not delete $kind $id in $region; run 'hop down $region' again"
+    fi
+  done
+}
+
 destroy_region() {
-  local region=$1 entry=$2 ids hosts host sg subnet
+  local region=$1 entry=$2 ids hosts host sg
   ids=$(jq -r '.instances[].id' <<<"$entry")
   hosts=$(jq -r '.instances[].host' <<<"$entry")
   sg=$(jq -r '.sg // empty' <<<"$entry")
@@ -370,13 +413,9 @@ destroy_region() {
     # shellcheck disable=SC2086
     aws_ ec2 wait instance-terminated --region "$region" --instance-ids $ids
   fi
-  for subnet in $(jq -r '.subnets[]' <<<"$entry"); do
-    if aws_ ec2 delete-subnet --region "$region" --subnet-id "$subnet" >/dev/null; then
-      log "deleted subnet $subnet in $region"
-    else
-      log "hop: could not delete subnet $subnet in $region; run 'hop down $region' again"
-    fi
-  done
+  delete_each "$region" "$entry" subnets subnet subnet-id
+  delete_each "$region" "$entry" rtbs route-table route-table-id
+  delete_each "$region" "$entry" cagws carrier-gateway carrier-gateway-id
   if [[ -n $sg ]]; then
     if aws_ ec2 delete-security-group --region "$region" --group-id "$sg" >/dev/null; then
       log "deleted security group $sg in $region"
@@ -401,7 +440,7 @@ cmd_up() {
         ;;
     esac
   done
-  [[ -n $place ]] || die "usage: hop up <region or Local Zone> [--ttl HOURS]"
+  [[ -n $place ]] || die "usage: hop up <region or zone> [--ttl HOURS]"
   [[ $ttl =~ ^[1-9][0-9]*$ ]] || die "--ttl must be a whole number of hours"
   local region zone='' regions existing host id ip
   region=$(region_of "$place")
@@ -430,7 +469,8 @@ cmd_up() {
   fi
 
   ip=$(aws_ ec2 describe-instances --region "$region" --instance-ids "$id" \
-    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+    --query 'Reservations[0].Instances[0].PublicIpAddress||Reservations[0].Instances[0].NetworkInterfaces[0].Association.CarrierIp' \
+    --output text)
   tailscale set --exit-node="$(jq -r '.TailscaleIPs[0]' <<<"$(ts_peer "$host")")"
   verify_egress "$ip" || die "routing through $host is set but the public IP check failed"
   echo "$host $place $ip"
@@ -446,7 +486,7 @@ cmd_down() {
     ts_release
   fi
   # shellcheck disable=SC2086
-  scan $regions | jq -c '.[] | select(.sg != null or (.subnets | length > 0) or (.instances | length > 0))' |
+  scan $regions | jq -c '.[] | select(.sg != null or (.subnets + .rtbs + .cagws + .instances | length > 0))' |
     while read -r entry; do
       region=$(jq -r .region <<<"$entry")
       destroy_region "$region" "$entry"
@@ -481,8 +521,8 @@ cmd_zones() {
   local region
   for region in $(enabled_regions); do
     aws_ ec2 describe-availability-zones --region "$region" --all-availability-zones \
-      --filters Name=zone-type,Values=local-zone \
-      --query 'AvailabilityZones[].[ZoneName,OptInStatus]' --output text &
+      --filters Name=zone-type,Values=local-zone,wavelength-zone \
+      --query 'AvailabilityZones[].[ZoneName,ZoneType,OptInStatus]' --output text &
   done | sort
 }
 

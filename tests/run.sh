@@ -46,14 +46,15 @@ case "$3 $4" in
     touch "$STATE/subnet"
     echo subnet-z
     ;;
+  "ec2 describe-route-tables" | "ec2 describe-carrier-gateways") echo '[]' ;;
   "ec2 delete-subnet") rm -f "$STATE/subnet" ;;
   "ec2 describe-availability-zones")
     if [[ $* != *us-east-1-bue-1a* ]]; then
       echo None
     elif [[ -f $STATE/optedin ]]; then
-      printf 'opted-in\tus-east-1-bue-1\n'
+      printf 'opted-in\tus-east-1-bue-1\tlocal-zone\n'
     else
-      printf 'not-opted-in\tus-east-1-bue-1\n'
+      printf 'not-opted-in\tus-east-1-bue-1\tlocal-zone\n'
     fi
     ;;
   "ec2 modify-availability-zone-group") touch "$STATE/optedin" ;;
