@@ -63,7 +63,24 @@ case "$3 $4" in
     echo sg-123
     ;;
   "ec2 describe-instance-type-offerings")
-    if [[ $* == *availability-zone* ]]; then printf 'c5.large\tt3.medium\n'; else printf 't3.micro\tt4g.micro\n'; fi
+    if [[ $* == *availability-zone* ]]; then
+      echo '["c5.large","t3.medium","g4dn.xlarge"]'
+    else
+      echo '["t3.micro","t4g.micro","t4g.nano","t3.nano","m7g.large"]'
+    fi
+    ;;
+  "ec2 describe-instance-types")
+    cat <<'JSON'
+[{"type":"g4dn.xlarge","memory":2048,"vcpus":4,"archs":["x86_64"],"gpu":{"Gpus":[]}},
+ {"type":"m7g.large","memory":8192,"vcpus":2,"archs":["arm64"],"gpu":null},
+ {"type":"c5.large","memory":4096,"vcpus":2,"archs":["x86_64"],"gpu":null},
+ {"type":"t3.medium","memory":4096,"vcpus":2,"archs":["i386","x86_64"],"gpu":null},
+ {"type":"t3.micro","memory":1024,"vcpus":2,"archs":["x86_64"],"gpu":null},
+ {"type":"t3.nano","memory":512,"vcpus":2,"archs":["x86_64"],"gpu":null},
+ {"type":"t4g.micro","memory":1024,"vcpus":2,"archs":["arm64"],"gpu":null},
+ {"type":"t4g.nano","memory":512,"vcpus":2,"archs":["arm64"],"gpu":null},
+ {"type":"x9.nano","memory":256,"vcpus":1,"archs":["arm64"],"gpu":null}]
+JSON
     ;;
   "ec2 run-instances")
     for a in "$@"; do
@@ -163,7 +180,8 @@ out=$("$ROOT/hop" up eu-west-2 2>"$WORK/err")
 expect "up prints host, region and IP" test "$out" = "hop-eu-west-2-beef eu-west-2 203.0.113.7"
 expect "up launches with terminate-on-shutdown" called "--instance-initiated-shutdown-behavior terminate"
 expect "up requires IMDSv2" called "--metadata-options HttpTokens=required"
-expect "up picks the arm64 image for t4g.micro" called "al2023-ami-kernel-default-arm64"
+expect "up picks the smallest type with enough memory" called "--instance-type t4g.nano"
+expect "up picks the image for that type's architecture" called "al2023-ami-kernel-default-arm64"
 refute "up attaches no key pair" called "--key-name"
 refute "up attaches no instance role" called "--iam-instance-profile"
 expect "up opens only UDP 41641" called "IpProtocol=udp,FromPort=41641,ToPort=41641"
@@ -198,6 +216,10 @@ expect "--ttl sets the self-destruct timer" grep -qF -- "--on-active=2h" "$STATE
 refute "--ttl rejects a non-number" "$ROOT/hop" up eu-west-2 --ttl soon
 
 reset
+HOP_MIN_MEMORY_MIB=1024 "$ROOT/hop" up eu-west-2 >/dev/null 2>&1
+expect "a higher memory floor picks a larger type" called "--instance-type t4g.micro"
+
+reset
 refute "up refuses a region that is not enabled" "$ROOT/hop" up ap-east-1
 refute "a refused region launches nothing" called "run-instances"
 
@@ -219,7 +241,8 @@ expect "up in a Local Zone prints the zone" test "$out" = "hop-us-east-1-bue-1a-
 expect "a Local Zone is enabled on first use" called "modify-availability-zone-group --region us-east-1 --group-name us-east-1-bue-1 --opt-in-status opted-in"
 expect "a Local Zone gets its own subnet" called "create-subnet --region us-east-1 --vpc-id vpc-1 --availability-zone us-east-1-bue-1a --cidr-block 172.31.255.0/24"
 expect "a Local Zone node gets a public IP in that subnet" called "SubnetId=subnet-z,Groups=sg-123,AssociatePublicIpAddress=true"
-expect "a Local Zone falls back to a type it offers" called "--instance-type t3.medium"
+expect "a Local Zone gets the smallest type it offers" called "--instance-type c5.large"
+refute "a GPU type is never preferred over a plain one" called "--instance-type g4dn.xlarge"
 expect "a Local Zone node uses the x86 image" called "al2023-ami-kernel-default-x86_64"
 : >"$CALLS"
 "$ROOT/hop" up us-east-1 >/dev/null 2>&1

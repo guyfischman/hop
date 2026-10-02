@@ -12,6 +12,7 @@ TS_TAG=${HOP_TS_TAG:-tag:hop}
 TTL_HOURS=${HOP_TTL_HOURS:-8}
 JOIN_TIMEOUT=${HOP_JOIN_TIMEOUT:-240}
 ZONE_TIMEOUT=${HOP_ZONE_TIMEOUT:-600}
+MIN_MEMORY_MIB=${HOP_MIN_MEMORY_MIB:-512}
 POLL_INTERVAL=${HOP_POLL_INTERVAL:-5}
 HOME_REGION=${HOP_HOME_REGION:-us-east-1}
 SG_NAME=hop
@@ -46,6 +47,7 @@ Settings are read from $CONFIG:
   HOP_AWS_PROFILE   AWS CLI profile to launch into (required)
   HOP_TTL_HOURS     hours before a node destroys itself (default 8)
   HOP_TS_TAG        Tailscale tag for nodes (default tag:hop)
+  HOP_MIN_MEMORY_MIB   smallest instance memory to accept (default 512)
 EOF
 }
 
@@ -269,24 +271,28 @@ ensure_sg() {
 }
 
 pick_types() {
-  local region=$1 zone=${2:-} offered type found=0
-  local types="t4g.micro t3.micro t3.small t3.medium c5.large c6i.large t3.xlarge r5.xlarge c5.2xlarge m5.2xlarge"
+  local region=$1 zone=${2:-} offered specs
   if [[ -n $zone ]]; then
     offered=$(aws_ ec2 describe-instance-type-offerings --region "$region" --location-type availability-zone \
-      --filters "Name=location,Values=$zone" "Name=instance-type,Values=${types// /,}" \
-      --query 'InstanceTypeOfferings[].InstanceType' --output text)
+      --filters "Name=location,Values=$zone" --query 'InstanceTypeOfferings[].InstanceType')
   else
     offered=$(aws_ ec2 describe-instance-type-offerings --region "$region" \
-      --filters "Name=instance-type,Values=${types// /,}" \
-      --query 'InstanceTypeOfferings[].InstanceType' --output text)
+      --query 'InstanceTypeOfferings[].InstanceType')
   fi
-  for type in $types; do
-    if grep -qw "$type" <<<"$offered"; then
-      if [[ $type == t4g.* ]]; then echo "$type arm64"; else echo "$type x86_64"; fi
-      found=1
-    fi
-  done
-  ((found)) || die "${zone:-$region} offers none of: $types"
+  specs=$(aws_ ec2 describe-instance-types --region "$region" \
+    --filters Name=hypervisor,Values=nitro Name=bare-metal,Values=false \
+    Name=processor-info.supported-architecture,Values=arm64,x86_64 \
+    --query 'InstanceTypes[].{type:InstanceType,memory:MemoryInfo.SizeInMiB,vcpus:VCpuInfo.DefaultVCpus,archs:ProcessorInfo.SupportedArchitectures,gpu:GpuInfo}')
+  specs=$(jq -r -n --argjson offered "$offered" --argjson specs "$specs" --argjson min "$MIN_MEMORY_MIB" '
+    [$specs[]
+      | select(.type as $t | $offered | index($t))
+      | select(.memory >= $min)
+      | .arch = (if .archs | index("arm64") then "arm64" else "x86_64" end)]
+    | sort_by([(.gpu != null), .memory, (.arch != "arm64"), .vcpus, .type])
+    | .[:8][]
+    | "\(.type) \(.arch)"')
+  [[ -n $specs ]] || die "${zone:-$region} offers no instance type with at least $MIN_MEMORY_MIB MiB of memory"
+  echo "$specs"
 }
 
 user_data() {

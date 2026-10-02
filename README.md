@@ -89,10 +89,16 @@ before `hop regions` lists them.
 
 ## What a node is
 
-One `t4g.micro` (or `t3.micro` where the region has no Graviton) running the
-current Amazon Linux 2023 image, with no key pair, no instance role, IMDSv2
+The smallest instance the target offers, running the current Amazon Linux
+2023 image, with no key pair, no instance role, IMDSv2
 only, and a security group that admits UDP 41641 and nothing else. hop keeps
 no state on disk: a node is any instance carrying the `hop` tag.
+
+At launch hop lists every instance type the region or zone offers and ranks
+them by memory, then Graviton before x86, then vCPUs, with GPU types last.
+It takes the first with at least `HOP_MIN_MEMORY_MIB` (default 512) and moves
+down the list if a launch fails for lack of capacity. In a full region that
+is `t4g.nano`; it also needs `ec2:DescribeInstanceTypes`.
 
 ## Zones
 
@@ -102,8 +108,8 @@ minutes), creates a small subnet for it in the parent region's default VPC,
 and `hop down <zone>` removes the subnet again along with every node in that
 parent region. The zone stays enabled on the account.
 
-Zones offer few instance sizes, and the small ones can be out of capacity, so
-hop works up from `t3.medium` until a launch succeeds. Check `hop status` for
+Zones offer few instance sizes, often nothing below `t3.medium`, and the
+small ones can be out of capacity, so hop moves up until a launch succeeds. Check `hop status` for
 the size you got; a larger one costs more per hour.
 
 A Wavelength Zone sits inside a mobile carrier's network. The node reaches
