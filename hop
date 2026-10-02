@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG=${HOP_CONFIG:-$HOME/.config/hop/env}
+if [[ -f $CONFIG ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG"
+fi
+
+TS_API=${HOP_TS_API:-https://api.tailscale.com/api/v2}
+TS_TAG=${HOP_TS_TAG:-tag:hop}
+TTL_HOURS=${HOP_TTL_HOURS:-8}
+JOIN_TIMEOUT=${HOP_JOIN_TIMEOUT:-240}
+POLL_INTERVAL=${HOP_POLL_INTERVAL:-5}
+HOME_REGION=${HOP_HOME_REGION:-us-east-1}
+SG_NAME=hop
+WG_PORT=41641
+TS_TOKEN=
+
+export AWS_PAGER=
+export AWS_DEFAULT_OUTPUT=json
+
+die() {
+  echo "hop: $*" >&2
+  exit 1
+}
+
+log() {
+  echo "$*" >&2
+}
+
+usage() {
+  cat <<EOF
+Usage: hop <command>
+
+  up <region> [--ttl HOURS]   launch an exit node in the region and route this Mac through it
+  down [region]               stop using and destroy the node in the region, or every node
+  status [--json]             list running nodes and which one is in use
+  regions                     list the regions this AWS account can launch in
+  doctor                      check tools, credentials and Tailscale access
+
+Settings are read from $CONFIG:
+  HOP_AWS_PROFILE   AWS CLI profile to launch into (required)
+  HOP_TTL_HOURS     hours before a node destroys itself (default 8)
+  HOP_TS_TAG        Tailscale tag for nodes (default tag:hop)
+EOF
+}
+
+aws_() {
+  [[ -n ${HOP_AWS_PROFILE:-} ]] || die "HOP_AWS_PROFILE is not set; add it to $CONFIG"
+  aws --profile "$HOP_AWS_PROFILE" "$@"
+}
+
+ts_cred() {
+  local value=${!1:-}
+  if [[ -z $value ]]; then
+    value=$(security find-generic-password -s hop -a "$2" -w 2>/dev/null) ||
+      die "no Tailscale OAuth credential: set $1 or add Keychain item (service hop, account $2)"
+  fi
+  printf %s "$value"
+}
+
+ts_fetch_token() {
+  local id secret token
+  id=$(ts_cred TS_OAUTH_CLIENT_ID ts-oauth-client-id) || exit 1
+  secret=$(ts_cred TS_OAUTH_CLIENT_SECRET ts-oauth-client-secret) || exit 1
+  token=$(printf 'client_id=%s&client_secret=%s' "$id" "$secret" |
+    curl -fsS -d @- "$TS_API/oauth/token" | jq -r '.access_token // empty') ||
+    die "Tailscale rejected the OAuth client"
+  [[ -n $token ]] || die "Tailscale returned no access token"
+  printf %s "$token"
+}
+
+ts_login() {
+  [[ -n $TS_TOKEN ]] || TS_TOKEN=$(ts_fetch_token)
+}
+
+ts_api() {
+  local method=$1 path=$2 body=${3:-}
+  ts_login
+  if [[ -n $body ]]; then
+    printf 'Authorization: Bearer %s\n' "$TS_TOKEN" |
+      curl -fsS -X "$method" -H @- -H 'Content-Type: application/json' -d "$body" "$TS_API$path"
+  else
+    printf 'Authorization: Bearer %s\n' "$TS_TOKEN" |
+      curl -fsS -X "$method" -H @- "$TS_API$path"
+  fi
+}
+
+ts_mint_key() {
+  local body
+  body=$(jq -n --arg tag "$TS_TAG" '{
+    capabilities: {devices: {create: {reusable: false, ephemeral: true, preauthorized: true, tags: [$tag]}}},
+    expirySeconds: 600,
+    description: "hop"
+  }')
+  ts_api POST /tailnet/-/keys "$body"
+}
+
+ts_delete_devices() {
+  local id
+  [[ -n $TS_TOKEN ]] || return 0
+  for id in $(ts_api GET "/tailnet/-/devices?tags=$TS_TAG" | jq -r --arg tag "$TS_TAG" --arg host "${1:-}" \
+    '.devices[]? | select((.tags // []) | index($tag)) | select($host == "" or .hostname == $host) | .id'); do
+    if ts_api DELETE "/device/$id" >/dev/null; then
+      log "removed tailnet device $id"
+    fi
+  done
+}
+
+ts_peer() {
+  tailscale status --json | jq -c --arg h "$1" '[.Peer[]? | select(.HostName == $h)][0] // empty'
+}
+
+ts_current_exit() {
+  tailscale status --json | jq -r '[.Peer[]? | select(.ExitNode)][0].HostName // empty'
+}
+
+ts_release() {
+  local current
+  current=$(ts_current_exit)
+  if [[ -n $current && ( $# -eq 0 && $current == hop-* || $current == "${1:-}" ) ]]; then
+    tailscale set --exit-node=
+    log "stopped routing through $current"
+  fi
+}
+
+enabled_regions() {
+  aws_ ec2 describe-regions --region "$HOME_REGION" --query 'Regions[].RegionName' --output text | tr '\t' '\n' | sort
+}
+
+scan_region() {
+  local region=$1 instances sg
+  instances=$(aws_ ec2 describe-instances --region "$region" \
+    --filters Name=tag-key,Values=hop Name=instance-state-name,Values=pending,running \
+    --query 'Reservations[].Instances[].{id:InstanceId,ip:PublicIpAddress,type:InstanceType,launched:LaunchTime,host:Tags[?Key==`hop`]|[0].Value}')
+  sg=$(aws_ ec2 describe-security-groups --region "$region" --filters "Name=group-name,Values=$SG_NAME" \
+    --query 'SecurityGroups[0].GroupId' --output text)
+  jq -n --arg region "$region" --arg sg "$sg" --argjson instances "$instances" \
+    '{region: $region, sg: (if $sg == "None" then null else $sg end), instances: $instances}'
+}
+
+scan() {
+  local dir region failed=0
+  dir=$(mktemp -d)
+  for region in "$@"; do
+    scan_region "$region" >"$dir/$region.json" 2>"$dir/$region.err" &
+  done
+  wait
+  for region in "$@"; do
+    if [[ ! -s $dir/$region.json ]]; then
+      log "hop: could not scan $region: $(tail -1 "$dir/$region.err")"
+      failed=1
+    fi
+  done
+  jq -s . "$dir"/*.json
+  rm -rf "$dir"
+  return $failed
+}
+
+ensure_sg() {
+  local region=$1 vpc sg
+  vpc=$(aws_ ec2 describe-vpcs --region "$region" --filters Name=is-default,Values=true \
+    --query 'Vpcs[0].VpcId' --output text)
+  [[ $vpc != None ]] ||
+    die "$region has no default VPC; create one with: aws --profile $HOP_AWS_PROFILE ec2 create-default-vpc --region $region"
+  sg=$(aws_ ec2 describe-security-groups --region "$region" \
+    --filters "Name=group-name,Values=$SG_NAME" "Name=vpc-id,Values=$vpc" \
+    --query 'SecurityGroups[0].GroupId' --output text)
+  if [[ $sg == None ]]; then
+    sg=$(aws_ ec2 create-security-group --region "$region" --group-name "$SG_NAME" --vpc-id "$vpc" \
+      --description "hop exit node" \
+      --tag-specifications "ResourceType=security-group,Tags=[{Key=hop,Value=sg}]" \
+      --query GroupId --output text)
+    aws_ ec2 authorize-security-group-ingress --region "$region" --group-id "$sg" \
+      --ip-permissions "IpProtocol=udp,FromPort=$WG_PORT,ToPort=$WG_PORT,IpRanges=[{CidrIp=0.0.0.0/0}],Ipv6Ranges=[{CidrIpv6=::/0}]" \
+      >/dev/null
+  fi
+  echo "$sg"
+}
+
+pick_type() {
+  local offered
+  offered=$(aws_ ec2 describe-instance-type-offerings --region "$1" \
+    --filters Name=instance-type,Values=t4g.micro,t3.micro \
+    --query 'InstanceTypeOfferings[].InstanceType' --output text)
+  case $offered in
+    *t4g.micro*) echo "t4g.micro arm64" ;;
+    *t3.micro*) echo "t3.micro x86_64" ;;
+    *) die "$1 offers neither t4g.micro nor t3.micro" ;;
+  esac
+}
+
+user_data() {
+  local host=$1 key=$2 ttl=$3
+  cat <<EOF
+#!/bin/bash
+set -eu
+trap 'systemctl poweroff' ERR
+systemd-run --on-active=${ttl}h systemctl poweroff
+cat >/etc/sysctl.d/99-tailscale.conf <<SYSCTL
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+SYSCTL
+sysctl -p /etc/sysctl.d/99-tailscale.conf
+curl -fsSL https://tailscale.com/install.sh | sh
+tailscale up --auth-key=$key --hostname=$host --advertise-exit-node
+EOF
+}
+
+launch() {
+  local region=$1 ttl=$2 host=$3 sg spec type arch key file id
+  spec=$(pick_type "$region")
+  read -r type arch <<<"$spec"
+  key=$(ts_mint_key | jq -r '.key // empty') || true
+  [[ -n $key ]] || die "Tailscale returned no auth key; check the OAuth client has the auth_keys scope and $TS_TAG"
+  sg=$(ensure_sg "$region")
+  file=$(mktemp)
+  chmod 600 "$file"
+  user_data "$host" "$key" "$ttl" >"$file"
+  id=$(aws_ ec2 run-instances --region "$region" \
+    --image-id "resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-$arch" \
+    --instance-type "$type" \
+    --security-group-ids "$sg" \
+    --instance-initiated-shutdown-behavior terminate \
+    --metadata-options HttpTokens=required \
+    --user-data "file://$file" \
+    --tag-specifications \
+    "ResourceType=instance,Tags=[{Key=hop,Value=$host},{Key=Name,Value=$host}]" \
+    "ResourceType=volume,Tags=[{Key=hop,Value=$host}]" \
+    --query 'Instances[0].InstanceId' --output text) || {
+    rm -f "$file"
+    die "launch failed in $region"
+  }
+  rm -f "$file"
+  log "launched $id ($type) in $region as $host"
+  aws_ ec2 wait instance-running --region "$region" --instance-ids "$id"
+  echo "$id"
+}
+
+wait_for_join() {
+  local region=$1 host=$2 id=$3 waited=0 peer=''
+  log "waiting for $host to join the tailnet"
+  while ((waited < JOIN_TIMEOUT)); do
+    peer=$(ts_peer "$host")
+    if [[ -n $peer && $(jq -r .ExitNodeOption <<<"$peer") == true ]]; then
+      return 0
+    fi
+    sleep "$POLL_INTERVAL"
+    waited=$((waited + POLL_INTERVAL))
+  done
+  if [[ -n $peer ]]; then
+    log "hop: $host joined but is not approved as an exit node; add \"exitNode\": [\"$TS_TAG\"] to autoApprovers in the tailnet policy file"
+  else
+    log "hop: $host did not join within ${JOIN_TIMEOUT}s; last console output:"
+    aws_ ec2 get-console-output --region "$region" --instance-id "$id" --latest --query Output --output text 2>/dev/null |
+      tail -25 >&2 || true
+  fi
+  return 1
+}
+
+verify_egress() {
+  local expected=$1 seen='' tries=0
+  while ((tries < 6)); do
+    seen=$(curl -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null || true)
+    [[ $seen == "$expected" ]] && return 0
+    sleep "$POLL_INTERVAL"
+    tries=$((tries + 1))
+  done
+  log "hop: public IP is ${seen:-unknown}, expected $expected"
+  return 1
+}
+
+destroy_region() {
+  local region=$1 entry=$2 ids hosts host sg
+  ids=$(jq -r '.instances[].id' <<<"$entry")
+  hosts=$(jq -r '.instances[].host' <<<"$entry")
+  sg=$(jq -r '.sg // empty' <<<"$entry")
+  for host in $hosts; do
+    ts_release "$host"
+  done
+  if [[ -n $ids ]]; then
+    # shellcheck disable=SC2086
+    aws_ ec2 terminate-instances --region "$region" --instance-ids $ids >/dev/null
+    log "terminating ${ids//$'\n'/ } in $region"
+    for host in $hosts; do
+      ts_delete_devices "$host"
+    done
+    # shellcheck disable=SC2086
+    aws_ ec2 wait instance-terminated --region "$region" --instance-ids $ids
+  fi
+  if [[ -n $sg ]]; then
+    if aws_ ec2 delete-security-group --region "$region" --group-id "$sg" >/dev/null; then
+      log "deleted security group $sg in $region"
+    else
+      log "hop: could not delete security group $sg in $region; run 'hop down $region' again"
+    fi
+  fi
+}
+
+cmd_up() {
+  local region='' ttl=$TTL_HOURS
+  while (($#)); do
+    case $1 in
+      --ttl)
+        ttl=${2:-}
+        shift 2 || die "--ttl needs a number of hours"
+        ;;
+      -*) die "unknown option $1" ;;
+      *)
+        region=$1
+        shift
+        ;;
+    esac
+  done
+  [[ -n $region ]] || die "usage: hop up <region> [--ttl HOURS]"
+  [[ $ttl =~ ^[1-9][0-9]*$ ]] || die "--ttl must be a whole number of hours"
+  local regions existing host id ip
+  regions=$(enabled_regions)
+  grep -qx "$region" <<<"$regions" || die "$region is not enabled on this account; see 'hop regions'"
+  ts_login
+
+  existing=$(scan_region "$region" | jq -c '.instances[0] // empty')
+  if [[ -n $existing ]]; then
+    host=$(jq -r .host <<<"$existing")
+    id=$(jq -r .id <<<"$existing")
+    log "reusing $host ($id) in $region"
+  else
+    host="hop-$region-$(openssl rand -hex 2)"
+    id=$(launch "$region" "$ttl" "$host")
+  fi
+
+  if ! wait_for_join "$region" "$host" "$id"; then
+    [[ -n $existing ]] || destroy_region "$region" "$(scan_region "$region")"
+    exit 1
+  fi
+
+  ip=$(aws_ ec2 describe-instances --region "$region" --instance-ids "$id" \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+  tailscale set --exit-node="$(jq -r '.TailscaleIPs[0]' <<<"$(ts_peer "$host")")"
+  verify_egress "$ip" || die "routing through $host is set but the public IP check failed"
+  echo "$host $region $ip"
+}
+
+cmd_down() {
+  local regions entry region
+  ts_login || log "hop: no Tailscale API access; Tailscale removes the devices itself once they are offline"
+  if (($#)); then
+    regions=$1
+  else
+    regions=$(enabled_regions)
+    ts_release
+  fi
+  # shellcheck disable=SC2086
+  scan $regions | jq -c '.[] | select(.sg != null or (.instances | length > 0))' |
+    while read -r entry; do
+      region=$(jq -r .region <<<"$entry")
+      destroy_region "$region" "$entry"
+    done
+  if ((!$#)); then
+    ts_delete_devices
+  fi
+}
+
+cmd_status() {
+  local current nodes
+  current=$(ts_current_exit)
+  # shellcheck disable=SC2046
+  nodes=$(scan $(enabled_regions) | jq --arg current "$current" \
+    '[.[] | .region as $r | .instances[] | . + {region: $r, in_use: (.host == $current)}]')
+  if [[ ${1:-} == --json ]]; then
+    echo "$nodes"
+  elif [[ $(jq length <<<"$nodes") -eq 0 ]]; then
+    echo "no nodes running"
+  else
+    jq -r '["REGION", "HOST", "IP", "TYPE", "LAUNCHED", "IN USE"],
+      (.[] | [.region, .host, .ip // "-", .type, .launched, (if .in_use then "yes" else "" end)])
+      | @tsv' <<<"$nodes" | column -t -s $'\t'
+  fi
+}
+
+cmd_regions() {
+  enabled_regions
+}
+
+cmd_doctor() {
+  local failed=0 tool key_id
+  check() {
+    if ("${@:2}") >/dev/null 2>&1; then
+      echo "ok    $1"
+    else
+      echo "FAIL  $1"
+      failed=1
+    fi
+  }
+  for tool in aws tailscale curl jq openssl; do
+    check "$tool is installed" command -v "$tool"
+  done
+  check "HOP_AWS_PROFILE is set in $CONFIG" test -n "${HOP_AWS_PROFILE:-}"
+  check "AWS credentials work" aws_ sts get-caller-identity
+  check "AWS identity can describe EC2 regions" enabled_regions
+  check "Tailscale is running on this Mac" eval '[[ $(tailscale status --json | jq -r .BackendState) == Running ]]'
+  TS_TOKEN=$(ts_fetch_token 2>/dev/null) || true
+  check "Tailscale OAuth client is accepted" test -n "$TS_TOKEN"
+  key_id=$(ts_mint_key 2>/dev/null | jq -r '.id // empty') || true
+  check "OAuth client can mint keys for $TS_TAG" test -n "$key_id"
+  [[ -z $key_id ]] || ts_api DELETE "/tailnet/-/keys/$key_id" >/dev/null 2>&1 || true
+  check "OAuth client can list devices" ts_api GET "/tailnet/-/devices?tags=$TS_TAG"
+  echo "note  autoApprovers for $TS_TAG can't be read with these scopes; 'hop up' reports it if missing"
+  return $failed
+}
+
+main() {
+  local cmd=${1:-}
+  shift || true
+  case $cmd in
+    up | down | status | regions | doctor) "cmd_$cmd" "$@" ;;
+    "" | help | -h | --help) usage ;;
+    *) die "unknown command '$cmd'; run 'hop help'" ;;
+  esac
+}
+
+main "$@"
