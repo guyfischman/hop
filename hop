@@ -11,6 +11,7 @@ TS_API=${HOP_TS_API:-https://api.tailscale.com/api/v2}
 TS_TAG=${HOP_TS_TAG:-tag:hop}
 TTL_HOURS=${HOP_TTL_HOURS:-8}
 JOIN_TIMEOUT=${HOP_JOIN_TIMEOUT:-240}
+ZONE_TIMEOUT=${HOP_ZONE_TIMEOUT:-600}
 POLL_INTERVAL=${HOP_POLL_INTERVAL:-5}
 HOME_REGION=${HOP_HOME_REGION:-us-east-1}
 SG_NAME=hop
@@ -33,10 +34,11 @@ usage() {
   cat <<EOF
 Usage: hop <command>
 
-  up <region> [--ttl HOURS]   launch an exit node in the region and route this Mac through it
-  down [region]               stop using and destroy the node in the region, or every node
+  up <place> [--ttl HOURS]    launch an exit node in a region or Local Zone and route this Mac through it
+  down [place]                stop using and destroy the nodes in that region, or every node
   status [--json]             list running nodes and which one is in use
   regions                     list the regions this AWS account can launch in
+  zones                       list the Local Zones under those regions
   doctor                      check tools, credentials and Tailscale access
 
 Settings are read from $CONFIG:
@@ -125,19 +127,33 @@ ts_release() {
   fi
 }
 
+is_zone() {
+  [[ $1 =~ ^[a-z]+-[a-z]+-[0-9]+-[a-z]+-[0-9]+[a-z]$ ]]
+}
+
+region_of() {
+  if is_zone "$1"; then
+    cut -d- -f1-3 <<<"$1"
+  else
+    echo "$1"
+  fi
+}
+
 enabled_regions() {
   aws_ ec2 describe-regions --region "$HOME_REGION" --query 'Regions[].RegionName' --output text | tr '\t' '\n' | sort
 }
 
 scan_region() {
-  local region=$1 instances sg
+  local region=$1 instances sg subnets
   instances=$(aws_ ec2 describe-instances --region "$region" \
     --filters Name=tag-key,Values=hop Name=instance-state-name,Values=pending,running \
-    --query 'Reservations[].Instances[].{id:InstanceId,ip:PublicIpAddress,type:InstanceType,launched:LaunchTime,host:Tags[?Key==`hop`]|[0].Value}')
+    --query 'Reservations[].Instances[].{id:InstanceId,ip:PublicIpAddress,type:InstanceType,launched:LaunchTime,zone:Placement.AvailabilityZone,host:Tags[?Key==`hop`]|[0].Value}')
   sg=$(aws_ ec2 describe-security-groups --region "$region" --filters "Name=group-name,Values=$SG_NAME" \
     --query 'SecurityGroups[0].GroupId' --output text)
-  jq -n --arg region "$region" --arg sg "$sg" --argjson instances "$instances" \
-    '{region: $region, sg: (if $sg == "None" then null else $sg end), instances: $instances}'
+  subnets=$(aws_ ec2 describe-subnets --region "$region" --filters Name=tag-key,Values=hop \
+    --query 'Subnets[].SubnetId')
+  jq -n --arg region "$region" --arg sg "$sg" --argjson instances "$instances" --argjson subnets "$subnets" \
+    '{region: $region, sg: (if $sg == "None" then null else $sg end), subnets: $subnets, instances: $instances}'
 }
 
 scan() {
@@ -158,12 +174,55 @@ scan() {
   return $failed
 }
 
+default_vpc() {
+  local vpc
+  vpc=$(aws_ ec2 describe-vpcs --region "$1" --filters Name=is-default,Values=true \
+    --query 'Vpcs[0].[VpcId,CidrBlock]' --output text)
+  [[ $vpc != None* ]] ||
+    die "$1 has no default VPC; create one with: aws --profile $HOP_AWS_PROFILE ec2 create-default-vpc --region $1"
+  echo "$vpc"
+}
+
+ensure_zone() {
+  local region=$1 zone=$2 status group waited=0
+  read -r status group <<<"$(aws_ ec2 describe-availability-zones --region "$region" --all-availability-zones \
+    --filters "Name=zone-name,Values=$zone" Name=zone-type,Values=local-zone \
+    --query 'AvailabilityZones[0].[OptInStatus,GroupName]' --output text)"
+  [[ $status != None ]] || die "$zone is not a Local Zone of $region; see 'hop zones'"
+  [[ $status == not-opted-in ]] || return 0
+  aws_ ec2 modify-availability-zone-group --region "$region" --group-name "$group" --opt-in-status opted-in >/dev/null
+  log "enabled Local Zone group $group on the account; this takes a few minutes the first time"
+  while ((waited < ZONE_TIMEOUT)); do
+    read -r status group <<<"$(aws_ ec2 describe-availability-zones --region "$region" --all-availability-zones \
+      --filters "Name=zone-name,Values=$zone" Name=zone-type,Values=local-zone \
+      --query 'AvailabilityZones[0].[OptInStatus,GroupName]' --output text)"
+    [[ $status == opted-in ]] && return 0
+    sleep "$POLL_INTERVAL"
+    waited=$((waited + POLL_INTERVAL))
+  done
+  die "$zone is still being enabled; try again in a few minutes"
+}
+
+ensure_subnet() {
+  local region=$1 zone=$2 vpc=$3 cidr=$4 subnet third
+  subnet=$(aws_ ec2 describe-subnets --region "$region" \
+    --filters "Name=availability-zone,Values=$zone" "Name=vpc-id,Values=$vpc" \
+    --query 'Subnets[0].SubnetId' --output text)
+  if [[ $subnet == None ]]; then
+    for third in 255 254 253 252 251 250 249 248; do
+      subnet=$(aws_ ec2 create-subnet --region "$region" --vpc-id "$vpc" --availability-zone "$zone" \
+        --cidr-block "$(cut -d. -f1-2 <<<"$cidr").$third.0/24" \
+        --tag-specifications "ResourceType=subnet,Tags=[{Key=hop,Value=subnet},{Key=Name,Value=hop-$zone}]" \
+        --query Subnet.SubnetId --output text 2>/dev/null) && break
+      subnet=None
+    done
+    [[ $subnet != None ]] || die "could not create a subnet for $zone in $vpc"
+  fi
+  echo "$subnet"
+}
+
 ensure_sg() {
-  local region=$1 vpc sg
-  vpc=$(aws_ ec2 describe-vpcs --region "$region" --filters Name=is-default,Values=true \
-    --query 'Vpcs[0].VpcId' --output text)
-  [[ $vpc != None ]] ||
-    die "$region has no default VPC; create one with: aws --profile $HOP_AWS_PROFILE ec2 create-default-vpc --region $region"
+  local region=$1 vpc=$2 sg
   sg=$(aws_ ec2 describe-security-groups --region "$region" \
     --filters "Name=group-name,Values=$SG_NAME" "Name=vpc-id,Values=$vpc" \
     --query 'SecurityGroups[0].GroupId' --output text)
@@ -179,16 +238,25 @@ ensure_sg() {
   echo "$sg"
 }
 
-pick_type() {
-  local offered
-  offered=$(aws_ ec2 describe-instance-type-offerings --region "$1" \
-    --filters Name=instance-type,Values=t4g.micro,t3.micro \
-    --query 'InstanceTypeOfferings[].InstanceType' --output text)
-  case $offered in
-    *t4g.micro*) echo "t4g.micro arm64" ;;
-    *t3.micro*) echo "t3.micro x86_64" ;;
-    *) die "$1 offers neither t4g.micro nor t3.micro" ;;
-  esac
+pick_types() {
+  local region=$1 zone=${2:-} offered type found=0
+  local types="t4g.micro t3.micro t3.small t3.medium c5.large c6i.large t3.xlarge r5.xlarge c5.2xlarge m5.2xlarge"
+  if [[ -n $zone ]]; then
+    offered=$(aws_ ec2 describe-instance-type-offerings --region "$region" --location-type availability-zone \
+      --filters "Name=location,Values=$zone" "Name=instance-type,Values=${types// /,}" \
+      --query 'InstanceTypeOfferings[].InstanceType' --output text)
+  else
+    offered=$(aws_ ec2 describe-instance-type-offerings --region "$region" \
+      --filters "Name=instance-type,Values=${types// /,}" \
+      --query 'InstanceTypeOfferings[].InstanceType' --output text)
+  fi
+  for type in $types; do
+    if grep -qw "$type" <<<"$offered"; then
+      if [[ $type == t4g.* ]]; then echo "$type arm64"; else echo "$type x86_64"; fi
+      found=1
+    fi
+  done
+  ((found)) || die "${zone:-$region} offers none of: $types"
 }
 
 user_data() {
@@ -209,31 +277,44 @@ EOF
 }
 
 launch() {
-  local region=$1 ttl=$2 host=$3 sg spec type arch key file id
-  spec=$(pick_type "$region")
-  read -r type arch <<<"$spec"
+  local region=$1 ttl=$2 host=$3 zone=$4 sg spec specs type arch key file id='' vpc cidr subnet placement
+  [[ -z $zone ]] || ensure_zone "$region" "$zone"
+  specs=$(pick_types "$region" "$zone")
   key=$(ts_mint_key | jq -r '.key // empty') || true
   [[ -n $key ]] || die "Tailscale returned no auth key; check the OAuth client has the auth_keys scope and $TS_TAG"
-  sg=$(ensure_sg "$region")
+  spec=$(default_vpc "$region")
+  read -r vpc cidr <<<"$spec"
+  sg=$(ensure_sg "$region" "$vpc")
+  if [[ -n $zone ]]; then
+    subnet=$(ensure_subnet "$region" "$zone" "$vpc" "$cidr")
+    placement=(--network-interfaces "DeviceIndex=0,SubnetId=$subnet,Groups=$sg,AssociatePublicIpAddress=true"
+      --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeType=gp2}")
+  else
+    placement=(--security-group-ids "$sg")
+  fi
   file=$(mktemp)
   chmod 600 "$file"
   user_data "$host" "$key" "$ttl" >"$file"
-  id=$(aws_ ec2 run-instances --region "$region" \
-    --image-id "resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-$arch" \
-    --instance-type "$type" \
-    --security-group-ids "$sg" \
-    --instance-initiated-shutdown-behavior terminate \
-    --metadata-options HttpTokens=required \
-    --user-data "file://$file" \
-    --tag-specifications \
-    "ResourceType=instance,Tags=[{Key=hop,Value=$host},{Key=Name,Value=$host}]" \
-    "ResourceType=volume,Tags=[{Key=hop,Value=$host}]" \
-    --query 'Instances[0].InstanceId' --output text) || {
-    rm -f "$file"
-    die "launch failed in $region"
-  }
+  while read -r type arch; do
+    if id=$(aws_ ec2 run-instances --region "$region" \
+      --image-id "resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-$arch" \
+      --instance-type "$type" \
+      "${placement[@]}" \
+      --instance-initiated-shutdown-behavior terminate \
+      --metadata-options HttpTokens=required \
+      --user-data "file://$file" \
+      --tag-specifications \
+      "ResourceType=instance,Tags=[{Key=hop,Value=$host},{Key=Name,Value=$host}]" \
+      "ResourceType=volume,Tags=[{Key=hop,Value=$host}]" \
+      --query 'Instances[0].InstanceId' --output text); then
+      break
+    fi
+    log "hop: could not launch $type in ${zone:-$region}; trying the next size"
+    id=''
+  done <<<"$specs"
   rm -f "$file"
-  log "launched $id ($type) in $region as $host"
+  [[ -n $id ]] || die "launch failed in ${zone:-$region}"
+  log "launched $id ($type) in ${zone:-$region} as $host"
   aws_ ec2 wait instance-running --region "$region" --instance-ids "$id"
   echo "$id"
 }
@@ -272,7 +353,7 @@ verify_egress() {
 }
 
 destroy_region() {
-  local region=$1 entry=$2 ids hosts host sg
+  local region=$1 entry=$2 ids hosts host sg subnet
   ids=$(jq -r '.instances[].id' <<<"$entry")
   hosts=$(jq -r '.instances[].host' <<<"$entry")
   sg=$(jq -r '.sg // empty' <<<"$entry")
@@ -289,6 +370,13 @@ destroy_region() {
     # shellcheck disable=SC2086
     aws_ ec2 wait instance-terminated --region "$region" --instance-ids $ids
   fi
+  for subnet in $(jq -r '.subnets[]' <<<"$entry"); do
+    if aws_ ec2 delete-subnet --region "$region" --subnet-id "$subnet" >/dev/null; then
+      log "deleted subnet $subnet in $region"
+    else
+      log "hop: could not delete subnet $subnet in $region; run 'hop down $region' again"
+    fi
+  done
   if [[ -n $sg ]]; then
     if aws_ ec2 delete-security-group --region "$region" --group-id "$sg" >/dev/null; then
       log "deleted security group $sg in $region"
@@ -299,7 +387,7 @@ destroy_region() {
 }
 
 cmd_up() {
-  local region='' ttl=$TTL_HOURS
+  local place='' ttl=$TTL_HOURS
   while (($#)); do
     case $1 in
       --ttl)
@@ -308,26 +396,32 @@ cmd_up() {
         ;;
       -*) die "unknown option $1" ;;
       *)
-        region=$1
+        place=$1
         shift
         ;;
     esac
   done
-  [[ -n $region ]] || die "usage: hop up <region> [--ttl HOURS]"
+  [[ -n $place ]] || die "usage: hop up <region or Local Zone> [--ttl HOURS]"
   [[ $ttl =~ ^[1-9][0-9]*$ ]] || die "--ttl must be a whole number of hours"
-  local regions existing host id ip
+  local region zone='' regions existing host id ip
+  region=$(region_of "$place")
+  if is_zone "$place"; then zone=$place; fi
   regions=$(enabled_regions)
   grep -qx "$region" <<<"$regions" || die "$region is not enabled on this account; see 'hop regions'"
   ts_login
 
-  existing=$(scan_region "$region" | jq -c '.instances[0] // empty')
+  existing=$(scan_region "$region" | jq -c --arg zone "$zone" \
+    '[.instances[] | select(if $zone == "" then (.zone | test("^[a-z]+-[a-z]+-[0-9]+[a-z]$")) else .zone == $zone end)][0] // empty')
   if [[ -n $existing ]]; then
     host=$(jq -r .host <<<"$existing")
     id=$(jq -r .id <<<"$existing")
-    log "reusing $host ($id) in $region"
+    log "reusing $host ($id) in $place"
   else
-    host="hop-$region-$(openssl rand -hex 2)"
-    id=$(launch "$region" "$ttl" "$host")
+    host="hop-$place-$(openssl rand -hex 2)"
+    id=$(launch "$region" "$ttl" "$host" "$zone") || {
+      destroy_region "$region" "$(scan_region "$region")"
+      exit 1
+    }
   fi
 
   if ! wait_for_join "$region" "$host" "$id"; then
@@ -339,20 +433,20 @@ cmd_up() {
     --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
   tailscale set --exit-node="$(jq -r '.TailscaleIPs[0]' <<<"$(ts_peer "$host")")"
   verify_egress "$ip" || die "routing through $host is set but the public IP check failed"
-  echo "$host $region $ip"
+  echo "$host $place $ip"
 }
 
 cmd_down() {
   local regions entry region
   ts_login || log "hop: no Tailscale API access; Tailscale removes the devices itself once they are offline"
   if (($#)); then
-    regions=$1
+    regions=$(region_of "$1")
   else
     regions=$(enabled_regions)
     ts_release
   fi
   # shellcheck disable=SC2086
-  scan $regions | jq -c '.[] | select(.sg != null or (.instances | length > 0))' |
+  scan $regions | jq -c '.[] | select(.sg != null or (.subnets | length > 0) or (.instances | length > 0))' |
     while read -r entry; do
       region=$(jq -r .region <<<"$entry")
       destroy_region "$region" "$entry"
@@ -373,14 +467,23 @@ cmd_status() {
   elif [[ $(jq length <<<"$nodes") -eq 0 ]]; then
     echo "no nodes running"
   else
-    jq -r '["REGION", "HOST", "IP", "TYPE", "LAUNCHED", "IN USE"],
-      (.[] | [.region, .host, .ip // "-", .type, .launched, (if .in_use then "yes" else "" end)])
+    jq -r '["PLACE", "HOST", "IP", "TYPE", "LAUNCHED", "IN USE"],
+      (.[] | [.zone, .host, .ip // "-", .type, .launched, (if .in_use then "yes" else "" end)])
       | @tsv' <<<"$nodes" | column -t -s $'\t'
   fi
 }
 
 cmd_regions() {
   enabled_regions
+}
+
+cmd_zones() {
+  local region
+  for region in $(enabled_regions); do
+    aws_ ec2 describe-availability-zones --region "$region" --all-availability-zones \
+      --filters Name=zone-type,Values=local-zone \
+      --query 'AvailabilityZones[].[ZoneName,OptInStatus]' --output text &
+  done | sort
 }
 
 cmd_doctor() {
@@ -414,7 +517,7 @@ main() {
   local cmd=${1:-}
   shift || true
   case $cmd in
-    up | down | status | regions | doctor) "cmd_$cmd" "$@" ;;
+    up | down | status | regions | zones | doctor) "cmd_$cmd" "$@" ;;
     "" | help | -h | --help) usage ;;
     *) die "unknown command '$cmd'; run 'hop help'" ;;
   esac

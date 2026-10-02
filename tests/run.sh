@@ -26,26 +26,52 @@ case "$3 $4" in
   "ec2 describe-instances")
     if [[ $* == *--instance-ids* ]]; then
       echo 203.0.113.7
-    elif [[ -f $STATE/instance && $region == eu-west-2 ]]; then
-      echo '[{"id":"i-abc","ip":"203.0.113.7","type":"t4g.micro","launched":"2026-10-02T12:00:00+00:00","host":"hop-eu-west-2-beef"}]'
+    elif [[ -f $STATE/instance && $region == "$(cut -d' ' -f1 "$STATE/instance")" ]]; then
+      jq -n --arg zone "$(cut -d' ' -f2 "$STATE/instance")" --arg host "$(cut -d' ' -f3 "$STATE/instance")" \
+        '[{id: "i-abc", ip: "203.0.113.7", type: "t4g.micro", launched: "2026-10-02T12:00:00+00:00", zone: $zone, host: $host}]'
     else
       echo '[]'
     fi
     ;;
   "ec2 describe-security-groups")
-    if [[ -f $STATE/sg && $region == eu-west-2 ]]; then echo sg-123; else echo None; fi
+    if [[ -f $STATE/sg ]]; then echo sg-123; else echo None; fi
     ;;
-  "ec2 describe-vpcs") echo vpc-1 ;;
+  "ec2 describe-vpcs") printf 'vpc-1\t172.31.0.0/16\n' ;;
+  "ec2 describe-subnets")
+    if [[ $* == *tag-key* ]]; then
+      if [[ -f $STATE/subnet && $region == us-east-1 ]]; then echo '["subnet-z"]'; else echo '[]'; fi
+    elif [[ -f $STATE/subnet ]]; then echo subnet-z; else echo None; fi
+    ;;
+  "ec2 create-subnet")
+    touch "$STATE/subnet"
+    echo subnet-z
+    ;;
+  "ec2 delete-subnet") rm -f "$STATE/subnet" ;;
+  "ec2 describe-availability-zones")
+    if [[ $* != *us-east-1-bue-1a* ]]; then
+      echo None
+    elif [[ -f $STATE/optedin ]]; then
+      printf 'opted-in\tus-east-1-bue-1\n'
+    else
+      printf 'not-opted-in\tus-east-1-bue-1\n'
+    fi
+    ;;
+  "ec2 modify-availability-zone-group") touch "$STATE/optedin" ;;
   "ec2 create-security-group")
     touch "$STATE/sg"
     echo sg-123
     ;;
-  "ec2 describe-instance-type-offerings") printf 't3.micro\tt4g.micro\n' ;;
+  "ec2 describe-instance-type-offerings")
+    if [[ $* == *availability-zone* ]]; then printf 'c5.large\tt3.medium\n'; else printf 't3.micro\tt4g.micro\n'; fi
+    ;;
   "ec2 run-instances")
     for a in "$@"; do
       [[ $a == file://* ]] && cp "${a#file://}" "$STATE/userdata"
     done
-    touch "$STATE/instance"
+    zone=${region}a
+    [[ $* == *SubnetId=subnet-z* ]] && zone=us-east-1-bue-1a
+    host=$(sed -n 's/.*Key=Name,Value=\([^}]*\)}.*/\1/p' <<<"$*" | head -1)
+    echo "$region $zone $host" >"$STATE/instance"
     echo i-abc
     ;;
   "ec2 terminate-instances") rm -f "$STATE/instance" ;;
@@ -66,7 +92,8 @@ case "$1" in
       approved=true
       [[ -f $STATE/unapproved ]] && approved=false
       peers=$(jq -n --argjson e "$exit_node" --argjson a "$approved" \
-        '{k: {HostName: "hop-eu-west-2-beef", TailscaleIPs: ["100.64.0.9"], ExitNode: $e, ExitNodeOption: $a}}')
+        --arg h "$(cut -d' ' -f3 "$STATE/instance")" \
+        '{k: {HostName: $h, TailscaleIPs: ["100.64.0.9"], ExitNode: $e, ExitNodeOption: $a}}')
     fi
     jq -n --argjson p "$peers" '{BackendState: "Running", Peer: $p}'
     ;;
@@ -107,7 +134,7 @@ exit 0
 STUB
 
 export PATH=$WORK/bin:$PATH
-export HOP_CONFIG=$WORK/none HOP_AWS_PROFILE=test HOP_JOIN_TIMEOUT=2 HOP_POLL_INTERVAL=1
+export HOP_CONFIG=$WORK/none HOP_AWS_PROFILE=test HOP_JOIN_TIMEOUT=2 HOP_ZONE_TIMEOUT=2 HOP_POLL_INTERVAL=1
 unset TS_OAUTH_CLIENT_ID TS_OAUTH_CLIENT_SECRET
 
 failures=0
@@ -150,7 +177,7 @@ expect "up routes through the node's tailnet IP" called "tailscale set --exit-no
 refute "a second up reuses the running node" called "run-instances"
 
 out=$("$ROOT/hop" status 2>/dev/null)
-expect "status lists the node as in use" grep -qE "eu-west-2 +hop-eu-west-2-beef +203.0.113.7 +t4g.micro .* yes" <<<"$out"
+expect "status lists the node as in use" grep -qE "eu-west-2a +hop-eu-west-2-beef +203.0.113.7 +t4g.micro .* yes" <<<"$out"
 expect "status --json is valid JSON" jq -e '.[0].in_use == true' <<<"$("$ROOT/hop" status --json 2>/dev/null)"
 
 : >"$CALLS"
@@ -184,6 +211,21 @@ touch "$STATE/unapproved"
 "$ROOT/hop" up eu-west-2 >/dev/null 2>"$WORK/err"
 expect "an unapproved exit node names autoApprovers" grep -q autoApprovers "$WORK/err"
 refute "an unapproved exit node is never routed through" called "tailscale set --exit-node=100"
+
+reset
+out=$("$ROOT/hop" up us-east-1-bue-1a 2>"$WORK/err")
+expect "up in a Local Zone prints the zone" test "$out" = "hop-us-east-1-bue-1a-beef us-east-1-bue-1a 203.0.113.7"
+expect "a Local Zone is enabled on first use" called "modify-availability-zone-group --region us-east-1 --group-name us-east-1-bue-1 --opt-in-status opted-in"
+expect "a Local Zone gets its own subnet" called "create-subnet --region us-east-1 --vpc-id vpc-1 --availability-zone us-east-1-bue-1a --cidr-block 172.31.255.0/24"
+expect "a Local Zone node gets a public IP in that subnet" called "SubnetId=subnet-z,Groups=sg-123,AssociatePublicIpAddress=true"
+expect "a Local Zone falls back to a type it offers" called "--instance-type t3.medium"
+expect "a Local Zone node uses the x86 image" called "al2023-ami-kernel-default-x86_64"
+: >"$CALLS"
+"$ROOT/hop" up us-east-1 >/dev/null 2>&1
+expect "a region launch does not reuse the Local Zone node" called "run-instances"
+"$ROOT/hop" down us-east-1-bue-1a >/dev/null 2>&1
+expect "down by zone name cleans the parent region" test ! -e "$STATE/instance" -a ! -e "$STATE/subnet" -a ! -e "$STATE/sg"
+refute "an unknown zone is refused" "$ROOT/hop" up us-east-1-xyz-1a
 
 reset
 refute "a missing AWS profile is an error" env -u HOP_AWS_PROFILE "$ROOT/hop" regions
