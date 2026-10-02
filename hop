@@ -109,11 +109,11 @@ ts_delete_devices() {
 }
 
 ts_peer() {
-  tailscale status --json | jq -c --arg h "$1" '[.Peer[]? | select(.HostName == $h)][0] // empty'
+  tailscale status --json 2>/dev/null | jq -c --arg h "$1" '[.Peer[]? | select(.HostName == $h)][0] // empty'
 }
 
 ts_current_exit() {
-  tailscale status --json | jq -r '[.Peer[]? | select(.ExitNode)][0].HostName // empty'
+  tailscale status --json 2>/dev/null | jq -r '[.Peer[]? | select(.ExitNode)][0].HostName // empty'
 }
 
 ts_release() {
@@ -399,7 +399,7 @@ cmd_doctor() {
   check "HOP_AWS_PROFILE is set in $CONFIG" test -n "${HOP_AWS_PROFILE:-}"
   check "AWS credentials work" aws_ sts get-caller-identity
   check "AWS identity can describe EC2 regions" enabled_regions
-  check "Tailscale is running on this Mac" eval '[[ $(tailscale status --json | jq -r .BackendState) == Running ]]'
+  check "Tailscale is running on this Mac" eval '[[ $(tailscale status --json 2>/dev/null | jq -r .BackendState) == Running ]]'
   TS_TOKEN=$(ts_fetch_token 2>/dev/null) || true
   check "Tailscale OAuth client is accepted" test -n "$TS_TOKEN"
   key_id=$(ts_mint_key 2>/dev/null | jq -r '.id // empty') || true
