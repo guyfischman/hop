@@ -1,15 +1,15 @@
 # hop
 
 An IP address in an AWS region, Local Zone or Wavelength Zone of your choice,
-on demand. `hop up` launches a
-throwaway EC2 instance that joins your tailnet as an exit node and routes this
-Mac through it; `hop down` removes the instance, its security group and its
-tailnet device.
+on demand. `hop up` launches the cheapest throwaway EC2 instance the place
+offers, joins it to your tailnet as an exit node and routes this Mac through
+it; `hop down` removes the instance, everything hop created around it, and
+its tailnet device.
 
 ```
 hop up eu-west-2            # prints: <hostname> <region> <public ip>
 hop up eu-west-2 --spot     # the same on spare capacity, at the spot price
-hop status                  # running nodes, and which one is in use
+hop status                  # running nodes, and which one is in use; --json for scripts
 hop down                    # destroy every node; or: hop down eu-west-2
 hop regions                 # regions the AWS account can launch in
 hop zones                   # Local and Wavelength Zones under those regions
@@ -47,9 +47,8 @@ running on this Mac. The script runs under the stock macOS bash.
    if a node could ever reach one of your machines:
 
    ```json
-   "grants": [
-     {"src": ["autogroup:member"], "dst": ["*"], "ip": ["*"]},
-     {"src": ["autogroup:member"], "dst": ["autogroup:internet"], "ip": ["*"]},
+   "acls": [
+     {"action": "accept", "src": ["autogroup:member"], "dst": ["*:*"]},
    ],
    "tests": [
      {"src": "tag:hop", "deny": ["<tailnet IP of one of your machines>:22"]},
@@ -78,21 +77,23 @@ running on this Mac. The script runs under the stock macOS bash.
 
 ## AWS permissions
 
-The profile's identity needs, on EC2: `RunInstances`, `TerminateInstances`,
-`CreateTags`, `DescribeInstances`, `DescribeRegions`, `DescribeVpcs`,
-`DescribeInstanceTypeOfferings`, `DescribeSecurityGroups`,
-`CreateSecurityGroup`, `AuthorizeSecurityGroupIngress`, `DeleteSecurityGroup`,
-`GetConsoleOutput`; and `ssm:GetParameters` on
-`arn:aws:ssm:*::parameter/aws/service/ami-amazon-linux-latest/*`.
+The profile's identity needs these actions.
+
+| For | Actions |
+| --- | --- |
+| Every launch | `ec2:RunInstances`, `TerminateInstances`, `CreateTags`, `DescribeInstances`, `DescribeRegions`, `DescribeVpcs`, `DescribeSubnets`, `DescribeRouteTables`, `DescribeCarrierGateways`, `DescribeSecurityGroups`, `CreateSecurityGroup`, `AuthorizeSecurityGroupIngress`, `DeleteSecurityGroup`, `GetConsoleOutput`; `ssm:GetParameters` on `arn:aws:ssm:*::parameter/aws/service/ami-amazon-linux-latest/*` |
+| Choosing the cheapest type | `ec2:DescribeInstanceTypeOfferings`, `DescribeInstanceTypes`; `pricing:GetProducts`; for `--spot`, `ec2:DescribeSpotPriceHistory` |
+| Local and Wavelength Zones | `ec2:DescribeAvailabilityZones`, `ModifyAvailabilityZoneGroup`, `CreateSubnet`, `DeleteSubnet` |
+| Wavelength Zones only | `ec2:CreateCarrierGateway`, `DeleteCarrierGateway`, `CreateRouteTable`, `CreateRoute`, `AssociateRouteTable`, `DeleteRouteTable` |
 
 The region needs a default VPC. Opt-in regions must be enabled on the account
 before `hop regions` lists them.
 
 ## What a node is
 
-The smallest instance the target offers, running the current Amazon Linux
-2023 image, with no key pair, no instance role, IMDSv2
-only, and a security group that admits UDP 41641 and nothing else. hop keeps
+The cheapest instance the target offers, running the current Amazon Linux
+2023 image, with no key pair, no instance role, IMDSv2 only, and a security
+group that admits UDP 41641 and nothing else. hop keeps
 no state on disk: a node is any instance carrying the `hop` tag.
 
 At launch hop asks AWS which instance types the region or zone offers and
@@ -109,9 +110,8 @@ Mac is routed through it, run `hop down` to restore the connection. The
 Buenos Aires and Toronto zones have no spot prices, so `--spot` is refused
 there.
 
-Pricing needs `pricing:GetProducts`, `ec2:DescribeInstanceTypes` and, for
-`--spot`, `ec2:DescribeSpotPriceHistory`. If on-demand prices can't be read,
-hop says so and falls back to the least memory.
+If on-demand prices can't be read, hop says so and falls back to the least
+memory.
 
 ## Zones
 
@@ -122,20 +122,13 @@ and `hop down <zone>` removes the subnet again along with every node in that
 parent region. The zone stays enabled on the account.
 
 Zones offer few instance sizes, often nothing below `t3.medium`, and the
-small ones can be out of capacity, so hop moves on to the next cheapest. Check `hop status` for
-the size you got; a larger one costs more per hour.
+small ones can be out of capacity, so hop moves on to the next cheapest. The
+launch line and `hop status` show the size you got.
 
 A Wavelength Zone sits inside a mobile carrier's network. The node reaches
 the internet through a carrier gateway, websites see the carrier's address
 and not an Amazon one, and nothing on the internet can connect in, so
 Tailscale relays the traffic and it is slower than a direct connection.
-
-The identity also needs `ModifyAvailabilityZoneGroup`,
-`DescribeAvailabilityZones`, `CreateSubnet`, `DeleteSubnet`,
-`DescribeSubnets`, and for Wavelength `CreateCarrierGateway`,
-`DeleteCarrierGateway`, `DescribeCarrierGateways`, `CreateRouteTable`,
-`CreateRoute`, `AssociateRouteTable`, `DeleteRouteTable` and
-`DescribeRouteTables`.
 
 ## Tests
 

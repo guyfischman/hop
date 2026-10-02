@@ -3,7 +3,6 @@ set -euo pipefail
 
 CONFIG=${HOP_CONFIG:-$HOME/.config/hop/env}
 if [[ -f $CONFIG ]]; then
-  # shellcheck source=/dev/null
   source "$CONFIG"
 fi
 
@@ -46,10 +45,10 @@ Usage: hop <command>
   doctor                      check tools, credentials and Tailscale access
 
 Settings are read from $CONFIG:
-  HOP_AWS_PROFILE   AWS CLI profile to launch into (required)
-  HOP_TTL_HOURS     hours before a node destroys itself (default 8)
-  HOP_TS_TAG        Tailscale tag for nodes (default tag:hop)
-  HOP_MIN_MEMORY_MIB   smallest instance memory to accept (default 512)
+  HOP_AWS_PROFILE      AWS CLI profile to launch into (required)
+  HOP_TTL_HOURS        hours before a node destroys itself (default 8)
+  HOP_TS_TAG           Tailscale tag for nodes (default tag:hop)
+  HOP_MIN_MEMORY_MIB   least instance memory to accept (default 512)
 EOF
 }
 
@@ -466,13 +465,11 @@ destroy_region() {
     ts_release "$host"
   done
   if [[ -n $ids ]]; then
-    # shellcheck disable=SC2086
     aws_ ec2 terminate-instances --region "$region" --instance-ids $ids >/dev/null
     log "terminating ${ids//$'\n'/ } in $region"
     for host in $hosts; do
       ts_delete_devices "$host"
     done
-    # shellcheck disable=SC2086
     aws_ ec2 wait instance-terminated --region "$region" --instance-ids $ids
   fi
   delete_each "$region" "$entry" subnets subnet subnet-id
@@ -551,7 +548,6 @@ cmd_down() {
     regions=$(enabled_regions)
     ts_release
   fi
-  # shellcheck disable=SC2086
   scan $regions | jq -c '.[] | select(.sg != null or (.subnets + .rtbs + .cagws + .instances | length > 0))' |
     while read -r entry; do
       region=$(jq -r .region <<<"$entry")
@@ -565,7 +561,6 @@ cmd_down() {
 cmd_status() {
   local current nodes
   current=$(ts_current_exit)
-  # shellcheck disable=SC2046
   nodes=$(scan $(enabled_regions) | jq --arg current "$current" \
     '[.[] | .region as $r | .instances[] | . + {region: $r, in_use: (.host == $current)}]')
   if [[ ${1:-} == --json ]]; then
