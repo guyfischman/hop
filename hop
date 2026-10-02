@@ -36,7 +36,9 @@ usage() {
   cat <<EOF
 Usage: hop <command>
 
-  up <place> [--ttl HOURS]    launch an exit node in a region or zone and route this Mac through it
+  up <place> [--ttl HOURS] [--spot]
+                              launch the cheapest exit node a region or zone offers and route this Mac
+                              through it; --spot uses spare capacity, which AWS can reclaim at any time
   down [place]                stop using and destroy the nodes in that region, or every node
   status [--json]             list running nodes and which one is in use
   regions                     list the regions this AWS account can launch in
@@ -150,7 +152,7 @@ scan_region() {
   local region=$1 instances sg subnets rtbs cagws
   instances=$(aws_ ec2 describe-instances --region "$region" \
     --filters Name=tag-key,Values=hop Name=instance-state-name,Values=pending,running \
-    --query 'Reservations[].Instances[].{id:InstanceId,ip:PublicIpAddress||NetworkInterfaces[0].Association.CarrierIp,type:InstanceType,launched:LaunchTime,zone:Placement.AvailabilityZone,host:Tags[?Key==`hop`]|[0].Value}')
+    --query 'Reservations[].Instances[].{id:InstanceId,ip:PublicIpAddress||NetworkInterfaces[0].Association.CarrierIp,type:InstanceType,spot:InstanceLifecycle,launched:LaunchTime,zone:Placement.AvailabilityZone,host:Tags[?Key==`hop`]|[0].Value}')
   sg=$(aws_ ec2 describe-security-groups --region "$region" --filters "Name=group-name,Values=$SG_NAME" \
     --query 'SecurityGroups[0].GroupId' --output text)
   subnets=$(aws_ ec2 describe-subnets --region "$region" --filters Name=tag-key,Values=hop \
@@ -270,8 +272,39 @@ ensure_sg() {
   echo "$sg"
 }
 
+price_code() {
+  if [[ $1 == *-wlz-* ]]; then
+    sed -E 's/-([a-z]+)-wlz-([0-9]+)$/-\1\2/' <<<"$1"
+  elif is_zone "$1"; then
+    echo "${1%?}"
+  else
+    echo "$1"
+  fi
+}
+
+hourly_prices() {
+  aws_ pricing get-products --region us-east-1 --service-code AmazonEC2 \
+    --filters "Type=TERM_MATCH,Field=regionCode,Value=$(price_code "$1")" \
+    Type=TERM_MATCH,Field=operatingSystem,Value=Linux Type=TERM_MATCH,Field=tenancy,Value=Shared \
+    Type=TERM_MATCH,Field=preInstalledSw,Value=NA Type=TERM_MATCH,Field=capacitystatus,Value=Used \
+    --query PriceList |
+    jq '[.[] | fromjson
+      | {type: .product.attributes.instanceType, az: null,
+         usd: ([.terms.OnDemand[]?.priceDimensions[]?.pricePerUnit.USD][0] // "0" | tonumber)}]'
+}
+
+spot_prices() {
+  local region=$1 zone=$2 pattern
+  pattern="^${region}[a-z]\$"
+  [[ -z $zone ]] || pattern="^$zone\$"
+  aws_ ec2 describe-spot-price-history --region "$region" --product-descriptions Linux/UNIX \
+    --start-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --query 'SpotPriceHistory[].{type:InstanceType,az:AvailabilityZone,usd:SpotPrice}' |
+    jq --arg pattern "$pattern" '[.[] | select(.az | test($pattern)) | .usd |= tonumber]'
+}
+
 pick_types() {
-  local region=$1 zone=${2:-} offered specs
+  local region=$1 zone=$2 spot=$3 offered specs prices
   if [[ -n $zone ]]; then
     offered=$(aws_ ec2 describe-instance-type-offerings --region "$region" --location-type availability-zone \
       --filters "Name=location,Values=$zone" --query 'InstanceTypeOfferings[].InstanceType')
@@ -282,16 +315,27 @@ pick_types() {
   specs=$(aws_ ec2 describe-instance-types --region "$region" \
     --filters Name=hypervisor,Values=nitro Name=bare-metal,Values=false \
     Name=processor-info.supported-architecture,Values=arm64,x86_64 \
-    --query 'InstanceTypes[].{type:InstanceType,memory:MemoryInfo.SizeInMiB,vcpus:VCpuInfo.DefaultVCpus,archs:ProcessorInfo.SupportedArchitectures,gpu:GpuInfo}')
-  specs=$(jq -r -n --argjson offered "$offered" --argjson specs "$specs" --argjson min "$MIN_MEMORY_MIB" '
-    [$specs[]
-      | select(.type as $t | $offered | index($t))
-      | select(.memory >= $min)
-      | .arch = (if .archs | index("arm64") then "arm64" else "x86_64" end)]
-    | sort_by([(.gpu != null), .memory, (.arch != "arm64"), .vcpus, .type])
+    --query 'InstanceTypes[].{type:InstanceType,memory:MemoryInfo.SizeInMiB,archs:ProcessorInfo.SupportedArchitectures}')
+  if ((spot)); then
+    prices=$(spot_prices "$region" "$zone")
+    [[ $prices != '[]' ]] || die "${zone:-$region} has no spot prices; launch without --spot"
+  else
+    prices=$(hourly_prices "${zone:-$region}" 2>/dev/null) || prices='[]'
+    [[ $prices != '[]' ]] || log "hop: no prices for ${zone:-$region}; choosing by memory instead"
+  fi
+  specs=$(jq -r -n --argjson offered "$offered" --argjson specs "$specs" --argjson prices "$prices" \
+    --argjson min "$MIN_MEMORY_MIB" '
+    ($specs
+      | map(select(.memory >= $min) | select(.type as $t | $offered | index($t))
+          | .arch = (if .archs | index("arm64") then "arm64" else "x86_64" end))) as $usable
+    | ($usable | map({key: .type, value: .arch}) | from_entries) as $arch
+    | (if ($prices | length) == 0
+       then $usable | map({type, az: null, usd: null, rank: .memory})
+       else $prices | map(select(.usd > 0 and $arch[.type]) | .rank = .usd) end)
+    | sort_by([.rank, ($arch[.type] != "arm64"), .type, .az])
     | .[:8][]
-    | "\(.type) \(.arch)"')
-  [[ -n $specs ]] || die "${zone:-$region} offers no instance type with at least $MIN_MEMORY_MIB MiB of memory"
+    | "\(.type) \($arch[.type]) \(if .usd then .usd * 100000 | round / 100000 else "?" end) \(.az // "-")"')
+  [[ -n $specs ]] || die "${zone:-$region} offers no priced instance type with at least $MIN_MEMORY_MIB MiB of memory"
   echo "$specs"
 }
 
@@ -302,6 +346,10 @@ user_data() {
 set -eu
 trap 'systemctl poweroff' ERR
 systemd-run --on-active=${ttl}h systemctl poweroff
+dd if=/dev/zero of=/swap bs=1M count=768 status=none
+chmod 600 /swap
+mkswap /swap >/dev/null
+swapon /swap
 cat >/etc/sysctl.d/99-tailscale.conf <<SYSCTL
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
@@ -313,9 +361,10 @@ EOF
 }
 
 launch() {
-  local region=$1 ttl=$2 host=$3 zone=$4 sg spec specs type arch key file id='' vpc cidr subnet placement address
+  local region=$1 ttl=$2 host=$3 zone=$4 spot=$5 sg spec specs type arch usd az key file id='' vpc cidr subnet
+  local placement address market
   [[ -z $zone ]] || ensure_zone "$region" "$zone"
-  specs=$(pick_types "$region" "$zone")
+  specs=$(pick_types "$region" "$zone" "$spot")
   key=$(ts_mint_key | jq -r '.key // empty') || true
   [[ -n $key ]] || die "Tailscale returned no auth key; check the OAuth client has the auth_keys scope and $TS_TAG"
   spec=$(default_vpc "$region")
@@ -333,12 +382,18 @@ launch() {
   file=$(mktemp)
   chmod 600 "$file"
   user_data "$host" "$key" "$ttl" >"$file"
-  while read -r type arch; do
+  while read -r type arch usd az; do
+    market=(--instance-initiated-shutdown-behavior terminate)
+    if ((spot)); then
+      market+=(--instance-market-options
+        "MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}")
+      [[ -n $zone ]] || market+=(--placement "AvailabilityZone=$az")
+    fi
     if id=$(aws_ ec2 run-instances --region "$region" \
       --image-id "resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-$arch" \
       --instance-type "$type" \
       "${placement[@]}" \
-      --instance-initiated-shutdown-behavior terminate \
+      "${market[@]}" \
       --metadata-options HttpTokens=required \
       --user-data "file://$file" \
       --tag-specifications \
@@ -347,12 +402,13 @@ launch() {
       --query 'Instances[0].InstanceId' --output text); then
       break
     fi
-    log "hop: could not launch $type in ${zone:-$region}; trying the next size"
+    log "hop: could not launch $type in ${zone:-$region}; trying the next cheapest"
     id=''
   done <<<"$specs"
   rm -f "$file"
   [[ -n $id ]] || die "launch failed in ${zone:-$region}"
-  log "launched $id ($type) in ${zone:-$region} as $host"
+  if ((spot)); then type="$type spot"; fi
+  log "launched $id ($type, \$$usd/hour) in ${zone:-$region} as $host"
   aws_ ec2 wait instance-running --region "$region" --instance-ids "$id"
   echo "$id"
 }
@@ -432,12 +488,16 @@ destroy_region() {
 }
 
 cmd_up() {
-  local place='' ttl=$TTL_HOURS
+  local place='' ttl=$TTL_HOURS spot=0
   while (($#)); do
     case $1 in
       --ttl)
         ttl=${2:-}
         shift 2 || die "--ttl needs a number of hours"
+        ;;
+      --spot)
+        spot=1
+        shift
         ;;
       -*) die "unknown option $1" ;;
       *)
@@ -446,7 +506,7 @@ cmd_up() {
         ;;
     esac
   done
-  [[ -n $place ]] || die "usage: hop up <region or zone> [--ttl HOURS]"
+  [[ -n $place ]] || die "usage: hop up <region or zone> [--ttl HOURS] [--spot]"
   [[ $ttl =~ ^[1-9][0-9]*$ ]] || die "--ttl must be a whole number of hours"
   local region zone='' regions existing host id ip
   region=$(region_of "$place")
@@ -463,7 +523,7 @@ cmd_up() {
     log "reusing $host ($id) in $place"
   else
     host="hop-$place-$(openssl rand -hex 2)"
-    id=$(launch "$region" "$ttl" "$host" "$zone") || {
+    id=$(launch "$region" "$ttl" "$host" "$zone" "$spot") || {
       destroy_region "$region" "$(scan_region "$region")"
       exit 1
     }
@@ -514,7 +574,7 @@ cmd_status() {
     echo "no nodes running"
   else
     jq -r '["PLACE", "HOST", "IP", "TYPE", "LAUNCHED", "IN USE"],
-      (.[] | [.zone, .host, .ip // "-", .type, .launched, (if .in_use then "yes" else "" end)])
+      (.[] | [.zone, .host, .ip // "-", .type + (if .spot then " spot" else "" end), .launched, (if .in_use then "yes" else "" end)])
       | @tsv' <<<"$nodes" | column -t -s $'\t'
   fi
 }

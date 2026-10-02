@@ -69,6 +69,18 @@ case "$3 $4" in
       echo '["t3.micro","t4g.micro","t4g.nano","t3.nano","m7g.large"]'
     fi
     ;;
+  "pricing get-products")
+    [[ -f $STATE/noprices ]] && exit 1
+    jq -n '{"t4g.nano": "0.0047", "t3.nano": "0.0059", "t4g.micro": "0.0094", "t3.micro": "0.0118", "m7g.large": "0.0900",
+            "x9.nano": "0.0001", "c5.large": "0.2000", "t3.medium": "0.0773", "g4dn.xlarge": "0.9000", "t3.free": "0.0000"}
+      | [to_entries[] | {product: {attributes: {instanceType: .key}},
+                         terms: {OnDemand: {a: {priceDimensions: {b: {pricePerUnit: {USD: .value}}}}}}} | tojson]'
+    ;;
+  "ec2 describe-spot-price-history")
+    echo '[{"type":"t4g.nano","az":"eu-west-2a","usd":"0.0030"},{"type":"t4g.nano","az":"eu-west-2b","usd":"0.0019"},
+           {"type":"t3.nano","az":"eu-west-2a","usd":"0.0021"},{"type":"x9.nano","az":"eu-west-2a","usd":"0.0001"},
+           {"type":"t3.nano","az":"eu-west-2-wl1-lon-wlz-1","usd":"0.0002"}]'
+    ;;
   "ec2 describe-instance-types")
     cat <<'JSON'
 [{"type":"g4dn.xlarge","memory":2048,"vcpus":4,"archs":["x86_64"],"gpu":{"Gpus":[]}},
@@ -180,7 +192,8 @@ out=$("$ROOT/hop" up eu-west-2 2>"$WORK/err")
 expect "up prints host, region and IP" test "$out" = "hop-eu-west-2-beef eu-west-2 203.0.113.7"
 expect "up launches with terminate-on-shutdown" called "--instance-initiated-shutdown-behavior terminate"
 expect "up requires IMDSv2" called "--metadata-options HttpTokens=required"
-expect "up picks the smallest type with enough memory" called "--instance-type t4g.nano"
+expect "up picks the cheapest type with enough memory" called "--instance-type t4g.nano"
+expect "up prices the region" called "Field=regionCode,Value=eu-west-2"
 expect "up picks the image for that type's architecture" called "al2023-ami-kernel-default-arm64"
 refute "up attaches no key pair" called "--key-name"
 refute "up attaches no instance role" called "--iam-instance-profile"
@@ -220,6 +233,22 @@ HOP_MIN_MEMORY_MIB=1024 "$ROOT/hop" up eu-west-2 >/dev/null 2>&1
 expect "a higher memory floor picks a larger type" called "--instance-type t4g.micro"
 
 reset
+"$ROOT/hop" up eu-west-2 --spot >/dev/null 2>&1
+expect "--spot requests a spot instance" called "MarketType=spot"
+expect "--spot picks the cheapest type and zone pair" called "--instance-type t4g.nano"
+expect "--spot launches in the cheapest zone" called "--placement AvailabilityZone=eu-west-2b"
+: >"$CALLS"
+"$ROOT/hop" down >/dev/null 2>&1
+"$ROOT/hop" up eu-west-2 >/dev/null 2>&1
+refute "without --spot the launch is on demand" called "MarketType=spot"
+
+reset
+touch "$STATE/noprices"
+"$ROOT/hop" up eu-west-2 >/dev/null 2>"$WORK/err"
+expect "without prices up falls back to the least memory" called "--instance-type t4g.nano"
+expect "without prices up says so" grep -q "no prices" "$WORK/err"
+
+reset
 refute "up refuses a region that is not enabled" "$ROOT/hop" up ap-east-1
 refute "a refused region launches nothing" called "run-instances"
 
@@ -241,8 +270,8 @@ expect "up in a Local Zone prints the zone" test "$out" = "hop-us-east-1-bue-1a-
 expect "a Local Zone is enabled on first use" called "modify-availability-zone-group --region us-east-1 --group-name us-east-1-bue-1 --opt-in-status opted-in"
 expect "a Local Zone gets its own subnet" called "create-subnet --region us-east-1 --vpc-id vpc-1 --availability-zone us-east-1-bue-1a --cidr-block 172.31.255.0/24"
 expect "a Local Zone node gets a public IP in that subnet" called "SubnetId=subnet-z,Groups=sg-123,AssociatePublicIpAddress=true"
-expect "a Local Zone gets the smallest type it offers" called "--instance-type c5.large"
-refute "a GPU type is never preferred over a plain one" called "--instance-type g4dn.xlarge"
+expect "a Local Zone gets the cheapest type it offers" called "--instance-type t3.medium"
+expect "a Local Zone is priced under its group name" called "Field=regionCode,Value=us-east-1-bue-1 "
 expect "a Local Zone node uses the x86 image" called "al2023-ami-kernel-default-x86_64"
 : >"$CALLS"
 "$ROOT/hop" up us-east-1 >/dev/null 2>&1

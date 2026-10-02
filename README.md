@@ -8,6 +8,7 @@ tailnet device.
 
 ```
 hop up eu-west-2            # prints: <hostname> <region> <public ip>
+hop up eu-west-2 --spot     # the same on spare capacity, at the spot price
 hop status                  # running nodes, and which one is in use
 hop down                    # destroy every node; or: hop down eu-west-2
 hop regions                 # regions the AWS account can launch in
@@ -94,11 +95,23 @@ The smallest instance the target offers, running the current Amazon Linux
 only, and a security group that admits UDP 41641 and nothing else. hop keeps
 no state on disk: a node is any instance carrying the `hop` tag.
 
-At launch hop lists every instance type the region or zone offers and ranks
-them by memory, then Graviton before x86, then vCPUs, with GPU types last.
-It takes the first with at least `HOP_MIN_MEMORY_MIB` (default 512) and moves
-down the list if a launch fails for lack of capacity. In a full region that
-is `t4g.nano`; it also needs `ec2:DescribeInstanceTypes`.
+At launch hop asks AWS which instance types the region or zone offers and
+what each costs per hour right now, and launches the cheapest with at least
+`HOP_MIN_MEMORY_MIB` (default 512). If that launch fails for lack of
+capacity it tries the next cheapest. Nothing about sizes or prices is stored
+in hop. The node adds a swap file before installing Tailscale, because the
+package install does not fit in 0.5 GB of memory on its own.
+
+With `--spot` the ranking uses current spot prices, per availability zone,
+and the node is a one-time spot instance in the cheapest zone. AWS can
+reclaim a spot instance at two minutes' notice; if that happens while this
+Mac is routed through it, run `hop down` to restore the connection. The
+Buenos Aires and Toronto zones have no spot prices, so `--spot` is refused
+there.
+
+Pricing needs `pricing:GetProducts`, `ec2:DescribeInstanceTypes` and, for
+`--spot`, `ec2:DescribeSpotPriceHistory`. If on-demand prices can't be read,
+hop says so and falls back to the least memory.
 
 ## Zones
 
@@ -109,7 +122,7 @@ and `hop down <zone>` removes the subnet again along with every node in that
 parent region. The zone stays enabled on the account.
 
 Zones offer few instance sizes, often nothing below `t3.medium`, and the
-small ones can be out of capacity, so hop moves up until a launch succeeds. Check `hop status` for
+small ones can be out of capacity, so hop moves on to the next cheapest. Check `hop status` for
 the size you got; a larger one costs more per hour.
 
 A Wavelength Zone sits inside a mobile carrier's network. The node reaches
