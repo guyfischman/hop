@@ -35,6 +35,22 @@ running on this Mac. The script runs under the stock macOS bash.
    },
    ```
 
+   Then keep the node out of the rest of the tailnet. Tailscale denies
+   whatever no rule allows, but the default allow-all rule has `*` as its
+   source, and `*` includes tagged devices. Give every rule a source that
+   names people, not `*`, and add a test so the policy file refuses to save
+   if a node could ever reach one of your machines:
+
+   ```json
+   "grants": [
+     {"src": ["autogroup:member"], "dst": ["*"], "ip": ["*"]},
+     {"src": ["autogroup:member"], "dst": ["autogroup:internet"], "ip": ["*"]},
+   ],
+   "tests": [
+     {"src": "tag:hop", "deny": ["<tailnet IP of one of your machines>:22"]},
+   ],
+   ```
+
 2. Create a Tailscale OAuth client with the `auth_keys` and `devices:core`
    scopes (write), both restricted to `tag:hop`. Store it in the Keychain;
    each command prompts for the value:
