@@ -3,7 +3,8 @@ set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+pkill -f "hop watch n[12] " 2>/dev/null
+trap 'pkill -f "hop watch n[12] " 2>/dev/null; rm -rf "$WORK"' EXIT
 export STATE=$WORK/state CALLS=$WORK/calls
 mkdir -p "$STATE" "$WORK/bin"
 
@@ -157,7 +158,14 @@ case "$1" in
       '{BackendState: "Running", Self: {Online: $s}, Peer: $p} + (if $x then {ExitNodeStatus: $x} else {} end)'
     ;;
   ping)
-    if [[ -f $STATE/nopong ]]; then exit 1; fi
+    if [[ $* == *"--c 0"* ]]; then
+      while [[ -d $STATE ]]; do
+        if [[ -f $STATE/nodedead || -f $STATE/stall ]]; then echo 'ping "100.64.0.9" timed out'; else echo "pong from node (100.64.0.9) in 20ms"; fi
+        /bin/sleep 0.1
+      done
+    elif [[ -f $STATE/nodedead ]]; then
+      exit 1
+    fi
     ;;
   set)
     if [[ $2 == --exit-node= ]]; then rm -f "$STATE/exit"; else touch "$STATE/exit"; fi
@@ -176,6 +184,7 @@ case "$*" in
     echo '{"devices":[{"id":"d1","hostname":"hop-eu-west-2-beef","tags":["tag:hop"]},{"id":"d2","hostname":"laptop"},{"id":"d3","hostname":"hop-eu-west-2-beef","tags":["tag:other"]},{"id":"d4","hostname":"hop-us-west-2-cafe","tags":["tag:hop"]}]}'
     ;;
   *checkip*)
+    if [[ -f $STATE/nointernet ]]; then exit 7; fi
     if [[ -f $STATE/wrongip ]]; then echo 198.51.100.1; else echo 203.0.113.7; fi
     ;;
   *) echo '{}' ;;
@@ -255,7 +264,7 @@ expect "down terminates the instance" called "terminate-instances --region eu-we
 expect "down deletes the tagged tailnet device" called "/device/d1"
 refute "down leaves untagged devices alone" called "/device/d2"
 refute "down leaves other tags alone" called "/device/d3"
-refute "down leaves the devices of nodes it did not destroy" called "/device/d4"
+expect "down removes the devices of nodes that died on their own" called "/device/d4"
 expect "down looks for the security group by tag" called "describe-security-groups --region eu-west-2 --filters Name=group-name,Values=hop Name=tag-key,Values=hop"
 expect "down deletes the security group" called "delete-security-group --region eu-west-2 --group-id sg-123"
 expect "down leaves nothing behind" test ! -e "$STATE/instance" -a ! -e "$STATE/sg" -a ! -e "$STATE/exit"
@@ -276,6 +285,13 @@ expect "down by place stops routing even when AWS is unreachable" test ! -e "$ST
 touch "$STATE/exit"
 "$ROOT/hop" down us-east-1 >/dev/null 2>&1
 expect "down by place keeps routing through a node elsewhere" test -e "$STATE/exit"
+rm -f "$STATE/offline"
+: >"$CALLS"
+"$ROOT/hop" down us-east-1 >/dev/null 2>&1
+refute "down by place leaves the devices of other regions" called "/device/d"
+"$ROOT/hop" down us-west-2 >/dev/null 2>&1
+expect "down by place removes that region's leftover devices" called "/device/d4"
+refute "down by place removes only that region's devices" called "/device/d1"
 
 reset
 "$ROOT/hop" up eu-west-2 >/dev/null 2>&1
@@ -297,22 +313,45 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
 done
 expect "up leaves a watcher that stops routing when the node dies" test ! -e "$STATE/exit"
 touch "$STATE/exit"
-"$ROOT/hop" watch n2 hop-elsewhere >/dev/null 2>&1
-expect "a watcher leaves an exit node that is not its own" test -e "$STATE/exit"
 rm -f "$STATE/nodedead"
+"$ROOT/hop" watch n2 hop-elsewhere 100.64.0.8 >/dev/null 2>&1
+expect "a watcher ends without touching an exit node that is not its own" test -e "$STATE/exit"
+
+watch_until() {
+  "$ROOT/hop" watch n1 hop-eu-west-2-beef 100.64.0.9 >/dev/null 2>&1 &
+  watcher=$!
+  /bin/sleep 2
+}
 touch "$STATE/selfoffline" "$STATE/nodedead"
-"$ROOT/hop" watch n1 hop-eu-west-2-beef >/dev/null 2>&1 &
-watcher=$!
-/bin/sleep 1
+: >"$CALLS"
+watch_until
 expect "a watcher keeps routing while this Mac is itself offline" test -e "$STATE/exit"
+refute "a watcher does not switch routing while this Mac is itself offline" called "tailscale set"
 rm -f "$STATE/selfoffline"
 wait "$watcher"
 expect "a watcher stops routing once the node is seen to be down" test ! -e "$STATE/exit"
+expect "a watcher pings the node's tailnet address" called "tailscale ping --until-direct=false --c 0 --timeout 750ms 100.64.0.9"
+
 rm -f "$STATE/nodedead"
-touch "$STATE/exit" "$STATE/nopong"
-"$ROOT/hop" watch n1 hop-eu-west-2-beef >/dev/null 2>&1
-expect "a watcher stops routing when the node stops answering pings though Tailscale still shows it online" test ! -e "$STATE/exit"
-expect "a watcher pings the node's tailnet address" called "tailscale ping --c 1 --timeout 3s 100.64.0.9"
+touch "$STATE/exit" "$STATE/stall"
+: >"$CALLS"
+watch_until
+rm -f "$STATE/stall"
+/bin/sleep 1
+expect "a watcher switches routing back on when the node answers after a stall" called "tailscale set --exit-node=100.64.0.9"
+expect "a watcher keeps routing through a node that only stalled" test -e "$STATE/exit"
+kill "$watcher" 2>/dev/null
+wait "$watcher" 2>/dev/null
+
+touch "$STATE/exit" "$STATE/nodedead" "$STATE/nointernet"
+: >"$CALLS"
+watch_until
+expect "a watcher switches routing back on when the internet is unreachable without the node" called "tailscale set --exit-node=100.64.0.9"
+rm -f "$STATE/nointernet"
+wait "$watcher"
+expect "a watcher gives the node up once the internet is back and the node is not" test ! -e "$STATE/exit"
+expect "a watcher removes the tailnet device of a node it gave up" called "/device/d1"
+refute "a watcher leaves other nodes' tailnet devices" called "/device/d4"
 
 reset
 "$ROOT/hop" up eu-west-2 --ttl 2 >/dev/null 2>&1

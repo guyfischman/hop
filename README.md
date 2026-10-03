@@ -4,7 +4,7 @@ An IP address in an AWS region, Local Zone or Wavelength Zone of your choice,
 on demand. `hop up` launches the cheapest throwaway EC2 instance the place
 offers, joins it to your tailnet as an exit node and routes this Mac through
 it; `hop down` removes the instance, everything hop created around it, and
-its tailnet device.
+its tailnet device, along with the devices of nodes that died on their own.
 
 ```
 hop up eu-west-2            # prints: <hostname> <region> <public ip>
@@ -22,12 +22,16 @@ A node destroys itself after 8 hours even if `down` never runs. Change that
 per launch with `--ttl HOURS` or for good with `HOP_TTL_HOURS`.
 
 Tailscale drops all traffic while its exit node is gone, so `hop up` leaves a
-small watcher running on this Mac. When the node in use stops answering,
-because it expired, was reclaimed or was terminated, the watcher switches
-routing off within about half a minute, the Mac goes back to its own
-connection and its own IP address, and a notification says so. The watcher
-ends when it has done that, or when the Mac stops using that node. It does
-not survive a restart of the Mac; `hop down` restores the connection then.
+small watcher running on this Mac. It pings the node in use about once a
+second. When two pings in a row go unanswered, because the node expired, was
+reclaimed or was terminated, the watcher switches routing off, so the Mac is
+back on its own connection and its own IP address within two or three
+seconds. It then checks that the internet is reachable and the node still
+does not answer: if so a notification says routing is off for good and the
+node's tailnet device is removed, and if not, the fault was a stall or this Mac's own network, and routing through
+the node is switched back on. The watcher ends when it has given the node up,
+or when the Mac stops using that node. It does not survive a restart of the
+Mac; `hop down` restores the connection then.
 
 ## Requirements
 
