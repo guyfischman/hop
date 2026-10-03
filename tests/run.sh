@@ -147,7 +147,9 @@ case "$*" in
   *"-X GET"*tailnet/-/devices*)
     echo '{"devices":[{"id":"d1","hostname":"hop-eu-west-2-beef","tags":["tag:hop"]},{"id":"d2","hostname":"laptop"},{"id":"d3","hostname":"hop-eu-west-2-beef","tags":["tag:other"]}]}'
     ;;
-  *checkip*) echo 203.0.113.7 ;;
+  *checkip*)
+    if [[ -f $STATE/wrongip ]]; then echo 198.51.100.1; else echo 203.0.113.7; fi
+    ;;
   *) echo '{}' ;;
 esac
 STUB
@@ -288,6 +290,12 @@ touch "$STATE/nojoin"
 refute "up fails when the node never joins" "$ROOT/hop" up eu-west-2
 expect "a node that never joins is terminated" called "terminate-instances"
 expect "a node that never joins leaves no security group" test ! -e "$STATE/sg"
+
+reset
+touch "$STATE/wrongip"
+refute "up fails when the public IP is not the node's" "$ROOT/hop" up eu-west-2
+expect "a failed IP check switches routing back off" test ! -e "$STATE/exit"
+expect "a failed IP check keeps the node" test -e "$STATE/instance"
 
 reset
 touch "$STATE/unapproved"

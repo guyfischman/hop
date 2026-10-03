@@ -551,7 +551,10 @@ cmd_up() {
     --query 'Reservations[0].Instances[0].PublicIpAddress||Reservations[0].Instances[0].NetworkInterfaces[0].Association.CarrierIp' \
     --output text)
   tailscale set --exit-node="$(jq -r '.TailscaleIPs[0]' <<<"$(ts_peer "$host")")"
-  verify_egress "$ip" || die "routing through $host is set but the public IP check failed"
+  if ! verify_egress "$ip"; then
+    tailscale set --exit-node=
+    die "the public IP check through $host failed, so routing is switched back off; the node is still running"
+  fi
   echo "$host $place $ip"
 }
 
