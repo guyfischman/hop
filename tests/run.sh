@@ -211,6 +211,8 @@ expect "up routes through the node's tailnet IP" called "tailscale set --exit-no
 : >"$CALLS"
 "$ROOT/hop" up eu-west-2 >/dev/null 2>&1
 refute "a second up reuses the running node" called "run-instances"
+"$ROOT/hop" up eu-west-2 --ttl 2 --spot >/dev/null 2>"$WORK/err"
+expect "a reused node says its flags were ignored" grep -qF -- "--ttl --spot only applies to a new node" "$WORK/err"
 
 out=$("$ROOT/hop" status 2>/dev/null)
 expect "status lists the node as in use" grep -qE "eu-west-2a +hop-eu-west-2-beef +203.0.113.7 +t4g.micro .* yes" <<<"$out"

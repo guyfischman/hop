@@ -497,15 +497,17 @@ abandon() {
 }
 
 cmd_up() {
-  local place='' ttl=$TTL_HOURS spot=0
+  local place='' ttl=$TTL_HOURS spot=0 asked=''
   while (($#)); do
     case $1 in
       --ttl)
         ttl=${2:-}
+        asked+=' --ttl'
         shift 2 || die "--ttl needs a number of hours"
         ;;
       --spot)
         spot=1
+        asked+=' --spot'
         shift
         ;;
       -*) die "unknown option $1" ;;
@@ -531,6 +533,7 @@ cmd_up() {
     host=$(jq -r .host <<<"$existing")
     id=$(jq -r .id <<<"$existing")
     log "reusing $host ($id) in $place"
+    [[ -z $asked ]] || log "hop:$asked only applies to a new node; run 'hop down $place' first to replace this one"
   else
     host="hop-$place-$(openssl rand -hex 2)"
     id=$(launch "$region" "$ttl" "$host" "$zone" "$spot") || {
