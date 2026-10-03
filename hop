@@ -368,7 +368,7 @@ EOF
 
 launch() {
   local region=$1 ttl=$2 host=$3 zone=$4 spot=$5 sg spec specs type arch usd az key file id='' vpc cidr subnet
-  local placement address market
+  local placement address market err
   [[ -z $zone ]] || ensure_zone "$region" "$zone"
   specs=$(pick_types "$region" "$zone" "$spot") || exit 1
   key=$(ts_mint_key | jq -r '.key // empty') || true
@@ -388,6 +388,7 @@ launch() {
   file=$(mktemp)
   chmod 600 "$file"
   user_data "$host" "$key" "$ttl" >"$file"
+  err=$(mktemp)
   while read -r type arch usd az; do
     market=(--instance-initiated-shutdown-behavior terminate)
     if ((spot)); then
@@ -405,13 +406,17 @@ launch() {
       --tag-specifications \
       "ResourceType=instance,Tags=[{Key=hop,Value=$host},{Key=Name,Value=$host}]" \
       "ResourceType=volume,Tags=[{Key=hop,Value=$host}]" \
-      --query 'Instances[0].InstanceId' --output text); then
+      --query 'Instances[0].InstanceId' --output text 2>"$err"); then
+      break
+    fi
+    cat "$err" >&2
+    id=''
+    if grep -qE 'UnauthorizedOperation|AuthFailure|ExpiredToken|InvalidClientTokenId|OptInRequired|PendingVerification' "$err"; then
       break
     fi
     log "hop: could not launch $type in ${zone:-$region}; trying the next cheapest"
-    id=''
   done <<<"$specs"
-  rm -f "$file"
+  rm -f "$file" "$err"
   [[ -n $id ]] || die "launch failed in ${zone:-$region}"
   if ((spot)); then type="$type spot"; fi
   log "launched $id ($type, \$$usd/hour) in ${zone:-$region} as $host"

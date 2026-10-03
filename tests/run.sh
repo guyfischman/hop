@@ -106,6 +106,14 @@ case "$3 $4" in
 JSON
     ;;
   "ec2 run-instances")
+    if [[ -f $STATE/denied ]]; then
+      echo "An error occurred (UnauthorizedOperation) when calling the RunInstances operation" >&2
+      exit 254
+    fi
+    if [[ -f $STATE/nocapacity && $* == *"--instance-type t4g.nano"* ]]; then
+      echo "An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation" >&2
+      exit 254
+    fi
     for a in "$@"; do
       [[ $a == file://* ]] && cp "${a#file://}" "$STATE/userdata"
     done
@@ -363,6 +371,18 @@ reset
 touch "$STATE/subnettaken"
 "$ROOT/hop" up us-east-1-bue-1a >/dev/null 2>&1
 expect "a taken subnet range moves on to the next" called "--cidr-block 172.31.254.0/24"
+
+reset
+touch "$STATE/nocapacity"
+"$ROOT/hop" up eu-west-2 >/dev/null 2>"$WORK/err"
+expect "no capacity moves on to the next cheapest type" called "--instance-type t3.nano"
+expect "no capacity shows the AWS error" grep -q InsufficientInstanceCapacity "$WORK/err"
+
+reset
+touch "$STATE/denied"
+refute "a launch AWS will not authorize fails" "$ROOT/hop" up eu-west-2
+expect "a launch AWS will not authorize is tried once" test "$(count run-instances)" = 1
+expect "a launch AWS will not authorize leaves no security group" test ! -e "$STATE/sg"
 
 reset
 refute "a missing AWS profile is an error" env -u HOP_AWS_PROFILE "$ROOT/hop" regions
