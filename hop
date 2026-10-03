@@ -634,6 +634,17 @@ cmd_watch() {
   agent_remove
 }
 
+report_path() {
+  local host=$1 address=$2 peer
+  tailscale ping --c 5 --timeout 2s "$address" >/dev/null 2>&1 || true
+  peer=$(ts_peer "$host")
+  if [[ -n $(jq -r '.CurAddr // empty' <<<"$peer") ]]; then
+    log "connected to $host directly"
+  else
+    log "hop: traffic to $host is relayed through Tailscale's $(jq -r '.Relay // "DERP"' <<<"$peer") relay, so it is slower than a direct connection"
+  fi
+}
+
 abandon() {
   local region=$1 host=$2
   destroy_region "$region" "$(scan_region "$region" | jq -c --arg host "$host" '
@@ -703,6 +714,7 @@ cmd_up() {
     tailscale set --exit-node=
     die "the public IP check through $host failed, so routing is switched back off; the node is still running"
   fi
+  report_path "$host" "$address"
   echo "$host $place $ip"
 }
 

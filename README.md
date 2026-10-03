@@ -147,6 +147,11 @@ Zones offer few instance sizes, often nothing below `t3.medium`, and the
 small ones can be out of capacity, so hop moves on to the next cheapest. The
 launch line and `hop status` show the size you got.
 
+`hop up` says whether this Mac reaches the node directly or through one of
+Tailscale's relays. The security group admits Tailscale's UDP port, so a node
+in a region or Local Zone is reached directly unless the network this Mac is
+on blocks UDP.
+
 A Wavelength Zone sits inside a mobile carrier's network. The node reaches
 the internet through a carrier gateway, websites see the carrier's address
 and not an Amazon one, and nothing on the internet can connect in, so

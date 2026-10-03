@@ -148,7 +148,8 @@ case "$1" in
       [[ -f $STATE/unapproved ]] && approved=false
       peers=$(jq -n --argjson e "$exit_node" --argjson a "$approved" \
         --arg h "$(cut -d' ' -f3 "$STATE/instance")" \
-        '{k: {ID: "n1", HostName: $h, TailscaleIPs: ["100.64.0.9"], ExitNode: $e, ExitNodeOption: $a}}')
+        --arg c "$([[ -f $STATE/relayed ]] || echo 203.0.113.7:41641)" \
+        '{k: {ID: "n1", HostName: $h, TailscaleIPs: ["100.64.0.9"], ExitNode: $e, ExitNodeOption: $a, CurAddr: $c, Relay: "lhr"}}')
     fi
     exit_status=null
     if [[ -f $STATE/exit ]]; then
@@ -263,6 +264,7 @@ expect "user-data schedules the default TTL" grep -qF -- "--on-active=8h" "$STAT
 refute "the auth key never appears on a command line" called "tskey-auth-test"
 refute "the OAuth secret never appears on a command line" called "secret"
 expect "up routes through the node's tailnet IP" called "tailscale set --exit-node=100.64.0.9"
+expect "up says the node is reached directly" grep -q "connected to hop-eu-west-2-beef directly" "$WORK/err"
 expect "up installs a launch agent that runs the watcher" grep -q "<string>$HOP</string>" "$HOME/Library/LaunchAgents/hop.watch.plist"
 expect "up loads the launch agent" called "launchctl bootstrap gui/$UID $HOME/Library/LaunchAgents/hop.watch.plist"
 
@@ -425,6 +427,11 @@ touch "$STATE/nojoin"
 refute "up fails when the node never joins" "$HOP" up eu-west-2
 expect "a node that never joins is terminated" called "terminate-instances"
 expect "a node that never joins leaves no security group" test ! -e "$STATE/sg"
+
+reset
+touch "$STATE/relayed"
+"$HOP" up eu-west-2 >/dev/null 2>"$WORK/err"
+expect "up says when the node is only reached through a relay" grep -q "relayed through Tailscale's lhr relay" "$WORK/err"
 
 reset
 touch "$STATE/wrongip"
