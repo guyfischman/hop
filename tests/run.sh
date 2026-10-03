@@ -161,7 +161,7 @@ case "$*" in
   *oauth/token*) echo '{"access_token":"tok"}' ;;
   *"-X POST"*tailnet/-/keys*) echo '{"id":"k1","key":"tskey-auth-test"}' ;;
   *"-X GET"*tailnet/-/devices*)
-    echo '{"devices":[{"id":"d1","hostname":"hop-eu-west-2-beef","tags":["tag:hop"]},{"id":"d2","hostname":"laptop"},{"id":"d3","hostname":"hop-eu-west-2-beef","tags":["tag:other"]}]}'
+    echo '{"devices":[{"id":"d1","hostname":"hop-eu-west-2-beef","tags":["tag:hop"]},{"id":"d2","hostname":"laptop"},{"id":"d3","hostname":"hop-eu-west-2-beef","tags":["tag:other"]},{"id":"d4","hostname":"hop-us-west-2-cafe","tags":["tag:hop"]}]}'
     ;;
   *checkip*)
     if [[ -f $STATE/wrongip ]]; then echo 198.51.100.1; else echo 203.0.113.7; fi
@@ -243,6 +243,7 @@ expect "down terminates the instance" called "terminate-instances --region eu-we
 expect "down deletes the tagged tailnet device" called "/device/d1"
 refute "down leaves untagged devices alone" called "/device/d2"
 refute "down leaves other tags alone" called "/device/d3"
+refute "down leaves the devices of nodes it did not destroy" called "/device/d4"
 expect "down looks for the security group by tag" called "describe-security-groups --region eu-west-2 --filters Name=group-name,Values=hop Name=tag-key,Values=hop"
 expect "down deletes the security group" called "delete-security-group --region eu-west-2 --group-id sg-123"
 expect "down leaves nothing behind" test ! -e "$STATE/instance" -a ! -e "$STATE/sg" -a ! -e "$STATE/exit"
