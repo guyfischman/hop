@@ -255,6 +255,9 @@ touch "$STATE/offline"
 : >"$CALLS"
 "$ROOT/hop" down >/dev/null 2>&1
 expect "down stops routing even when AWS is unreachable" test ! -e "$STATE/exit"
+refute "status fails when AWS is unreachable" "$ROOT/hop" status
+refute "status does not claim nothing is running when AWS is unreachable" grep -q "no nodes running" <<<"$("$ROOT/hop" status 2>/dev/null)"
+refute "zones fails when AWS is unreachable" "$ROOT/hop" zones
 touch "$STATE/exit"
 "$ROOT/hop" down eu-west-2 >/dev/null 2>&1
 expect "down by place stops routing even when AWS is unreachable" test ! -e "$STATE/exit"

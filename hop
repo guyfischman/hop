@@ -584,9 +584,10 @@ cmd_down() {
 }
 
 cmd_status() {
-  local current nodes
+  local current nodes regions
   current=$(ts_current_exit)
-  nodes=$(scan $(enabled_regions) | jq --arg current "$current" \
+  regions=$(enabled_regions)
+  nodes=$(scan $regions | jq --arg current "$current" \
     '[.[] | .region as $r | .instances[] | . + {region: $r, in_use: (.host == $current)}]')
   if [[ ${1:-} == --json ]]; then
     echo "$nodes"
@@ -604,8 +605,9 @@ cmd_regions() {
 }
 
 cmd_zones() {
-  local region
-  for region in $(enabled_regions); do
+  local region regions
+  regions=$(enabled_regions)
+  for region in $regions; do
     aws_ ec2 describe-availability-zones --region "$region" --all-availability-zones \
       --filters Name=zone-type,Values=local-zone,wavelength-zone \
       --query 'AvailabilityZones[].[ZoneName,ZoneType,OptInStatus]' --output text &
