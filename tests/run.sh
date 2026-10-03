@@ -116,6 +116,7 @@ stub tailscale <<'STUB'
 echo "tailscale $*" >>"$CALLS"
 case "$1" in
   status)
+    [[ -f $STATE/tsdown ]] && exit 1
     peers='{}'
     if [[ -f $STATE/instance && ! -f $STATE/nojoin ]]; then
       exit_node=false
@@ -236,6 +237,17 @@ expect "down by place stops routing even when AWS is unreachable" test ! -e "$ST
 touch "$STATE/exit"
 "$ROOT/hop" down us-east-1 >/dev/null 2>&1
 expect "down by place keeps routing through a node elsewhere" test -e "$STATE/exit"
+
+reset
+"$ROOT/hop" up eu-west-2 >/dev/null 2>&1
+touch "$STATE/tsdown"
+: >"$CALLS"
+expect "status lists nodes while Tailscale is not running" grep -q hop-eu-west-2-beef <<<"$("$ROOT/hop" status 2>/dev/null)"
+"$ROOT/hop" down >/dev/null 2>&1
+expect "down destroys nodes while Tailscale is not running" test ! -e "$STATE/instance" -a ! -e "$STATE/sg"
+"$ROOT/hop" up eu-west-2 >/dev/null 2>"$WORK/err"
+expect "up says when Tailscale is not running" grep -q "Tailscale is not running" "$WORK/err"
+refute "up launches nothing while Tailscale is not running" called "run-instances"
 
 reset
 "$ROOT/hop" up eu-west-2 --ttl 2 >/dev/null 2>&1
