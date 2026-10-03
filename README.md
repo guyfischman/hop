@@ -21,6 +21,14 @@ hop doctor                  # check tools, credentials and Tailscale access
 A node destroys itself after 8 hours even if `down` never runs. Change that
 per launch with `--ttl HOURS` or for good with `HOP_TTL_HOURS`.
 
+Tailscale drops all traffic while its exit node is gone, so `hop up` leaves a
+small watcher running on this Mac. When the node in use stops answering,
+because it expired, was reclaimed or was terminated, the watcher switches
+routing off within about half a minute, the Mac goes back to its own
+connection and its own IP address, and a notification says so. The watcher
+ends when it has done that, or when the Mac stops using that node. It does
+not survive a restart of the Mac; `hop down` restores the connection then.
+
 ## Requirements
 
 `aws` (v2), `tailscale`, `curl`, `jq` and `openssl` on the PATH, and Tailscale
@@ -106,7 +114,8 @@ package install does not fit in 0.5 GB of memory on its own.
 With `--spot` the ranking uses current spot prices, per availability zone,
 and the node is a one-time spot instance in the cheapest zone. AWS can
 reclaim a spot instance at two minutes' notice; if that happens while this
-Mac is routed through it, run `hop down` to restore the connection. The
+Mac is routed through it, the watcher puts the Mac back on its own
+connection. The
 Buenos Aires and Toronto zones have no spot prices, so `--spot` is refused
 there.
 

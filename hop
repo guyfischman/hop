@@ -13,6 +13,7 @@ JOIN_TIMEOUT=${HOP_JOIN_TIMEOUT:-240}
 ZONE_TIMEOUT=${HOP_ZONE_TIMEOUT:-600}
 MIN_MEMORY_MIB=${HOP_MIN_MEMORY_MIB:-512}
 POLL_INTERVAL=${HOP_POLL_INTERVAL:-5}
+WATCH_MISSES=${HOP_WATCH_MISSES:-3}
 HOME_REGION=${HOP_HOME_REGION:-us-east-1}
 SG_NAME=hop
 WG_PORT=41641
@@ -120,6 +121,12 @@ ts_peer() {
 
 ts_current_exit() {
   tailscale status --json 2>/dev/null | jq -r '[.Peer[]? | select(.ExitNode)][0].HostName // empty' || true
+}
+
+ts_exit_health() {
+  tailscale status --json 2>/dev/null |
+    jq -r '[.ExitNodeStatus.ID // "-", .ExitNodeStatus.Online // false, .Self.Online // false,
+      (.ExitNodeStatus.TailscaleIPs[0] // "-" | split("/")[0])] | @tsv' || true
 }
 
 ts_release() {
@@ -496,6 +503,32 @@ destroy_region() {
   fi
 }
 
+watch_node() {
+  local node=$1 host=$2 current online self ip misses=0
+  while ((misses < WATCH_MISSES)); do
+    sleep "$POLL_INTERVAL"
+    read -r current online self ip <<<"$(ts_exit_health)" || true
+    [[ -n $current ]] || continue
+    [[ $current == "$node" ]] || return 0
+    if [[ $self != true ]]; then
+      misses=0
+    elif [[ $online == false ]] || ! tailscale ping --c 1 --timeout 3s "$ip" >/dev/null 2>&1; then
+      misses=$((misses + 1))
+    else
+      misses=0
+    fi
+  done
+  tailscale set --exit-node=
+  log "$host stopped responding; stopped routing through it"
+  osascript -e "display notification \"$host stopped responding, so this Mac is back on its own connection\" with title \"hop\"" \
+    >/dev/null 2>&1 || true
+}
+
+cmd_watch() {
+  (($# == 2)) || die "usage: hop watch <tailnet node id> <hostname>"
+  watch_node "$1" "$2"
+}
+
 abandon() {
   local region=$1 host=$2
   destroy_region "$region" "$(scan_region "$region" | jq -c --arg host "$host" '
@@ -527,7 +560,7 @@ cmd_up() {
   done
   [[ -n $place ]] || die "usage: hop up <region or zone> [--ttl HOURS] [--spot]"
   [[ $ttl =~ ^[1-9][0-9]*$ ]] || die "--ttl must be a whole number of hours"
-  local region zone='' regions existing host id ip
+  local region zone='' regions existing host id ip peer node
   region=$(region_of "$place")
   if is_zone "$place"; then zone=$place; fi
   regions=$(enabled_regions)
@@ -558,24 +591,29 @@ cmd_up() {
   ip=$(aws_ ec2 describe-instances --region "$region" --instance-ids "$id" \
     --query 'Reservations[0].Instances[0].PublicIpAddress||Reservations[0].Instances[0].NetworkInterfaces[0].Association.CarrierIp' \
     --output text)
-  tailscale set --exit-node="$(jq -r '.TailscaleIPs[0]' <<<"$(ts_peer "$host")")"
+  peer=$(ts_peer "$host")
+  node=$(jq -r .ID <<<"$peer")
+  tailscale set --exit-node="$(jq -r '.TailscaleIPs[0]' <<<"$peer")"
   if ! verify_egress "$ip"; then
     tailscale set --exit-node=
     die "the public IP check through $host failed, so routing is switched back off; the node is still running"
+  fi
+  if ! pgrep -f "hop watch $node " >/dev/null 2>&1; then
+    nohup "$0" watch "$node" "$host" >/dev/null 2>&1 &
   fi
   echo "$host $place $ip"
 }
 
 cmd_down() {
   local regions entry region
-  ts_login || log "hop: no Tailscale API access; Tailscale removes the devices itself once they are offline"
   if (($#)); then
     regions=$(region_of "$1")
     ts_release "hop-$regions-*"
   else
     ts_release 'hop-*'
-    regions=$(enabled_regions)
   fi
+  ts_login || log "hop: no Tailscale API access; Tailscale removes the devices itself once they are offline"
+  (($#)) || regions=$(enabled_regions)
   scan $regions | jq -c '.[] | select(.sg != null or (.subnets + .rtbs + .cagws + .instances | length > 0))' |
     while read -r entry; do
       region=$(jq -r .region <<<"$entry")
@@ -645,7 +683,7 @@ main() {
   local cmd=${1:-}
   shift || true
   case $cmd in
-    up | down | status | regions | zones | doctor) "cmd_$cmd" "$@" ;;
+    up | down | status | regions | zones | doctor | watch) "cmd_$cmd" "$@" ;;
     "" | help | -h | --help) usage ;;
     *) die "unknown command '$cmd'; run 'hop help'" ;;
   esac

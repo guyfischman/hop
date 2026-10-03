@@ -143,9 +143,21 @@ case "$1" in
       [[ -f $STATE/unapproved ]] && approved=false
       peers=$(jq -n --argjson e "$exit_node" --argjson a "$approved" \
         --arg h "$(cut -d' ' -f3 "$STATE/instance")" \
-        '{k: {HostName: $h, TailscaleIPs: ["100.64.0.9"], ExitNode: $e, ExitNodeOption: $a}}')
+        '{k: {ID: "n1", HostName: $h, TailscaleIPs: ["100.64.0.9"], ExitNode: $e, ExitNodeOption: $a}}')
     fi
-    jq -n --argjson p "$peers" '{BackendState: "Running", Peer: $p}'
+    exit_status=null
+    if [[ -f $STATE/exit ]]; then
+      alive=true
+      [[ -f $STATE/nodedead ]] && alive=false
+      exit_status=$(jq -n --argjson o "$alive" '{ID: "n1", Online: $o, TailscaleIPs: ["100.64.0.9/32"]}')
+    fi
+    self=true
+    [[ -f $STATE/selfoffline ]] && self=false
+    jq -n --argjson p "$peers" --argjson x "$exit_status" --argjson s "$self" \
+      '{BackendState: "Running", Self: {Online: $s}, Peer: $p} + (if $x then {ExitNodeStatus: $x} else {} end)'
+    ;;
+  ping)
+    if [[ -f $STATE/nopong ]]; then exit 1; fi
     ;;
   set)
     if [[ $2 == --exit-node= ]]; then rm -f "$STATE/exit"; else touch "$STATE/exit"; fi
@@ -275,6 +287,32 @@ expect "down destroys nodes while Tailscale is not running" test ! -e "$STATE/in
 "$ROOT/hop" up eu-west-2 >/dev/null 2>"$WORK/err"
 expect "up says when Tailscale is not running" grep -q "Tailscale is not running" "$WORK/err"
 refute "up launches nothing while Tailscale is not running" called "run-instances"
+
+reset
+"$ROOT/hop" up eu-west-2 >/dev/null 2>&1
+touch "$STATE/nodedead"
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [[ -e $STATE/exit ]] || break
+  /bin/sleep 0.5
+done
+expect "up leaves a watcher that stops routing when the node dies" test ! -e "$STATE/exit"
+touch "$STATE/exit"
+"$ROOT/hop" watch n2 hop-elsewhere >/dev/null 2>&1
+expect "a watcher leaves an exit node that is not its own" test -e "$STATE/exit"
+rm -f "$STATE/nodedead"
+touch "$STATE/selfoffline" "$STATE/nodedead"
+"$ROOT/hop" watch n1 hop-eu-west-2-beef >/dev/null 2>&1 &
+watcher=$!
+/bin/sleep 1
+expect "a watcher keeps routing while this Mac is itself offline" test -e "$STATE/exit"
+rm -f "$STATE/selfoffline"
+wait "$watcher"
+expect "a watcher stops routing once the node is seen to be down" test ! -e "$STATE/exit"
+rm -f "$STATE/nodedead"
+touch "$STATE/exit" "$STATE/nopong"
+"$ROOT/hop" watch n1 hop-eu-west-2-beef >/dev/null 2>&1
+expect "a watcher stops routing when the node stops answering pings though Tailscale still shows it online" test ! -e "$STATE/exit"
+expect "a watcher pings the node's tailnet address" called "tailscale ping --c 1 --timeout 3s 100.64.0.9"
 
 reset
 "$ROOT/hop" up eu-west-2 --ttl 2 >/dev/null 2>&1
