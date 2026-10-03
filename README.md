@@ -21,17 +21,26 @@ hop doctor                  # check tools, credentials and Tailscale access
 A node destroys itself after 8 hours even if `down` never runs. Change that
 per launch with `--ttl HOURS` or for good with `HOP_TTL_HOURS`.
 
-Tailscale drops all traffic while its exit node is gone, so `hop up` leaves a
-small watcher running on this Mac. It pings the node in use about once a
-second. When two pings in a row go unanswered, because the node expired, was
-reclaimed or was terminated, the watcher switches routing off, so the Mac is
-back on its own connection and its own IP address within two or three
-seconds. It then checks that the internet is reachable and the node still
-does not answer: if so a notification says routing is off for good and the
-node's tailnet device is removed, and if not, the fault was a stall or this Mac's own network, and routing through
-the node is switched back on. The watcher ends when it has given the node up,
-or when the Mac stops using that node. It does not survive a restart of the
-Mac; `hop down` restores the connection then.
+Tailscale drops all traffic while its exit node is gone, so `hop up` installs
+a watcher as a launch agent (`~/Library/LaunchAgents/hop.watch.plist`). It
+exists only while this Mac routes through a hop node: launchd restarts it if
+it dies and starts it again after a restart of the Mac, and it removes itself
+once the Mac is no longer using a hop node.
+
+The watcher pings the node in use about once a second and fetches a small
+page through it every ten. It switches routing off, so the Mac is back on its
+own connection and its own IP address, when
+
+- two pings in a row go unanswered, because the node expired, was reclaimed
+  or was terminated; this takes two or three seconds;
+- the node answers pings but carries no traffic;
+- the node has left the tailnet.
+
+Before giving a node up for good the watcher checks that the internet is
+reachable without it. If it is not, the fault is this Mac's own network, and
+routing through the node is switched back on; the same happens when the node
+answers again after a stall. When it does give a node up, a notification says
+so and the node's tailnet device is removed.
 
 ## Requirements
 
