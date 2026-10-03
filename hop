@@ -106,8 +106,8 @@ ts_mint_key() {
 ts_delete_devices() {
   local id
   [[ -n $TS_TOKEN ]] || return 0
-  for id in $(ts_api GET "/tailnet/-/devices?tags=$TS_TAG" | jq -r --arg tag "$TS_TAG" --arg host "${1:-}" \
-    '.devices[]? | select((.tags // []) | index($tag)) | select($host == "" or .hostname == $host) | .id'); do
+  for id in $(ts_api GET "/tailnet/-/devices?tags=$TS_TAG" | jq -r --arg tag "$TS_TAG" --arg host "$1" \
+    '.devices[]? | select((.tags // []) | index($tag)) | select(.hostname == $host) | .id'); do
     if ts_api DELETE "/device/$id" >/dev/null; then
       log "removed tailnet device $id"
     fi
@@ -573,9 +573,6 @@ cmd_down() {
       region=$(jq -r .region <<<"$entry")
       destroy_region "$region" "$entry"
     done
-  if ((!$#)); then
-    ts_delete_devices
-  fi
 }
 
 cmd_status() {
