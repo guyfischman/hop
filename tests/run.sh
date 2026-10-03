@@ -46,6 +46,14 @@ case "$3 $4" in
     elif [[ -f $STATE/subnet ]]; then echo subnet-z; else echo None; fi
     ;;
   "ec2 create-subnet")
+    if [[ -f $STATE/subnetdenied ]]; then
+      echo "An error occurred (UnauthorizedOperation) when calling the CreateSubnet operation" >&2
+      exit 254
+    fi
+    if [[ -f $STATE/subnettaken && $* == *172.31.255.0/24* ]]; then
+      echo "An error occurred (InvalidSubnet.Conflict) when calling the CreateSubnet operation" >&2
+      exit 254
+    fi
     touch "$STATE/subnet"
     echo subnet-z
     ;;
@@ -344,6 +352,17 @@ reset
 expect "a region with a four-part name is not taken for a zone" called "describe-instances --region us-gov-west-1"
 "$ROOT/hop" down us-gov-west-1-xyz-1a >/dev/null 2>&1
 refute "a zone of such a region resolves to it" called "--region us-gov-west "
+
+reset
+touch "$STATE/subnetdenied"
+"$ROOT/hop" up us-east-1-bue-1a >/dev/null 2>"$WORK/err"
+expect "a refused subnet shows the AWS error" grep -q "could not create a subnet.*UnauthorizedOperation" "$WORK/err"
+expect "a refused subnet is not retried on other ranges" test "$(count create-subnet)" = 1
+
+reset
+touch "$STATE/subnettaken"
+"$ROOT/hop" up us-east-1-bue-1a >/dev/null 2>&1
+expect "a taken subnet range moves on to the next" called "--cidr-block 172.31.254.0/24"
 
 reset
 refute "a missing AWS profile is an error" env -u HOP_AWS_PROFILE "$ROOT/hop" regions

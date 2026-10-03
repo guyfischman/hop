@@ -217,19 +217,22 @@ ensure_zone() {
 }
 
 ensure_subnet() {
-  local region=$1 zone=$2 vpc=$3 cidr=$4 subnet third
+  local region=$1 zone=$2 vpc=$3 cidr=$4 subnet third out
   subnet=$(aws_ ec2 describe-subnets --region "$region" \
     --filters "Name=availability-zone,Values=$zone" "Name=vpc-id,Values=$vpc" \
     --query 'Subnets[0].SubnetId' --output text) || exit 1
   if [[ $subnet == None ]]; then
     for third in 255 254 253 252 251 250 249 248; do
-      subnet=$(aws_ ec2 create-subnet --region "$region" --vpc-id "$vpc" --availability-zone "$zone" \
+      if out=$(aws_ ec2 create-subnet --region "$region" --vpc-id "$vpc" --availability-zone "$zone" \
         --cidr-block "$(cut -d. -f1-2 <<<"$cidr").$third.0/24" \
         --tag-specifications "ResourceType=subnet,Tags=[{Key=hop,Value=subnet},{Key=Name,Value=hop-$zone}]" \
-        --query Subnet.SubnetId --output text 2>/dev/null) && break
-      subnet=None
+        --query Subnet.SubnetId --output text 2>&1); then
+        subnet=$out
+        break
+      fi
+      [[ $out == *InvalidSubnet.Conflict* ]] || die "could not create a subnet for $zone in $vpc: $out"
     done
-    [[ $subnet != None ]] || die "could not create a subnet for $zone in $vpc"
+    [[ $subnet != None ]] || die "could not create a subnet for $zone in $vpc: its last eight /24 ranges are taken"
     [[ $ZONE_TYPE != wavelength-zone ]] || route_via_carrier "$region" "$vpc" "$subnet"
   fi
   echo "$subnet"
