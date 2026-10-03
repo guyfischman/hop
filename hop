@@ -16,6 +16,8 @@ POLL_INTERVAL=${HOP_POLL_INTERVAL:-5}
 WATCH_MISSES=${HOP_WATCH_MISSES:-2}
 WATCH_TIMEOUT=${HOP_WATCH_TIMEOUT:-750ms}
 WATCH_PROBE_EVERY=${HOP_WATCH_PROBE_EVERY:-10}
+WATCH_GRACE=${HOP_WATCH_GRACE:-15}
+AGENT_LOG=$HOME/Library/Logs/hop.watch.log
 AGENT=hop.watch
 AGENT_PLIST=$HOME/Library/LaunchAgents/$AGENT.plist
 HOME_REGION=${HOP_HOME_REGION:-us-east-1}
@@ -520,14 +522,14 @@ destroy_region() {
 }
 
 online() {
-  curl -fsS --max-time 2 -o /dev/null https://checkip.amazonaws.com 2>/dev/null ||
-    curl -fsS --max-time 2 -o /dev/null http://captive.apple.com/hotspot-detect.html 2>/dev/null
+  curl -fsS --max-time "${1:-2}" -o /dev/null https://checkip.amazonaws.com 2>/dev/null ||
+    curl -fsS --max-time "${1:-2}" -o /dev/null http://captive.apple.com/hotspot-detect.html 2>/dev/null
 }
 
 give_up() {
   local host=$1
   tailscale set --exit-node=
-  log "$host stopped carrying traffic; stopped routing through it"
+  log "$(date '+%Y-%m-%d %H:%M:%S') $host stopped carrying traffic; stopped routing through it"
   osascript -e "display notification \"$host stopped carrying traffic, so this Mac is back on its own connection\" with title \"hop\"" \
     >/dev/null 2>&1
   ts_login
@@ -535,18 +537,25 @@ give_up() {
 }
 
 watch_pings() {
-  local node=$1 host=$2 ip=$3 line current rest misses=0 fails=0 seen=0
+  local node=$1 host=$2 ip=$3 line current rest misses=0 fails=0 seen=0 armed=0
   while read -r line; do
     case $line in
-      pong*) misses=0 ;;
+      pong*)
+        misses=0
+        armed=1
+        ;;
       *"timed out"*) misses=$((misses + 1)) ;;
       *) continue ;;
     esac
     seen=$((seen + 1))
+    if ((!armed)); then
+      ((seen >= WATCH_GRACE)) || continue
+      armed=1
+    fi
     if ((misses == 0 && seen % WATCH_PROBE_EVERY == 0)); then
       read -r current rest <<<"$(ts_exit_node)"
       [[ $current == "$node" ]] || return 0
-      if online; then fails=0; else fails=$((fails + 1)); fi
+      if online 4; then fails=0; else fails=$((fails + 1)); fi
     fi
     ((misses >= WATCH_MISSES || fails >= 2)) || continue
     read -r current rest <<<"$(ts_exit_node)"
@@ -556,9 +565,9 @@ watch_pings() {
       tailscale set --exit-node="$ip"
       return 0
     fi
-    if tailscale ping --c 1 --timeout 2s "$ip" >/dev/null 2>&1; then
+    if tailscale ping --until-direct=false --c 3 --timeout 3s "$ip" 2>&1 | grep -q '^pong'; then
       tailscale set --exit-node="$ip"
-      if online || { sleep 1 && online; }; then
+      if online 4 || { sleep 1 && online 4; } || { sleep 1 && online 4; }; then
         return 0
       fi
     fi
@@ -570,7 +579,7 @@ watch_pings() {
 agent_install() {
   local self
   self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
-  mkdir -p "$(dirname "$AGENT_PLIST")"
+  mkdir -p "$(dirname "$AGENT_PLIST")" "$(dirname "$AGENT_LOG")"
   cat >"$AGENT_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -599,6 +608,8 @@ agent_install() {
   </dict>
   <key>ProcessType</key>
   <string>Background</string>
+  <key>StandardErrorPath</key>
+  <string>$AGENT_LOG</string>
 </dict>
 </plist>
 EOF

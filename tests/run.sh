@@ -163,10 +163,14 @@ case "$1" in
   ping)
     if [[ $* == *"--c 0"* ]]; then
       while [[ -d $STATE ]]; do
-        if [[ -f $STATE/nodedead || -f $STATE/stall ]]; then echo 'ping "100.64.0.9" timed out'; else echo "pong from node (100.64.0.9) in 20ms"; fi
+        n=$((${n:-0} + 1))
+        if [[ -f $STATE/slowstart && $n -le 2 ]] || [[ -f $STATE/nodedead || -f $STATE/stall ]]; then echo 'ping "100.64.0.9" timed out'; else echo "pong from node (100.64.0.9) in 20ms"; fi
         /bin/sleep 0.1
       done
-    elif [[ -f $STATE/nodedead ]]; then
+    elif [[ ! -f $STATE/nodedead ]]; then
+      echo "pong from node (100.64.0.9) in 20ms"
+    else
+      echo 'ping "100.64.0.9" timed out'
       exit 1
     fi
     ;;
@@ -226,6 +230,7 @@ STUB
 
 export PATH=$WORK/bin:$PATH
 export HOP_CONFIG=$WORK/none HOP_AWS_PROFILE=test HOP_JOIN_TIMEOUT=2 HOP_ZONE_TIMEOUT=2 HOP_POLL_INTERVAL=1
+export HOP_WATCH_GRACE=3
 unset TS_OAUTH_CLIENT_ID TS_OAUTH_CLIENT_SECRET
 
 failures=0
@@ -384,7 +389,15 @@ watch_for 0
 wait "$watcher"
 expect "a watcher gives up a node that answers pings but carries no traffic" test ! -e "$STATE/exit"
 
-rm -f "$STATE/noegress" "$STATE/instance"
+rm -f "$STATE/noegress"
+touch "$STATE/exit" "$STATE/slowstart"
+watch_for 2
+expect "a watcher gives a node that has not answered yet time to come up" test -e "$STATE/exit"
+refute "a watcher does not switch routing while a node is still coming up" called "tailscale set"
+stop_watcher
+rm -f "$STATE/slowstart"
+
+rm -f "$STATE/instance"
 touch "$STATE/exit"
 watch_for 0
 wait "$watcher"
