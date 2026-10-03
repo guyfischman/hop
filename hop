@@ -110,7 +110,7 @@ ts_delete_devices() {
   [[ -n $TS_TOKEN ]] || return 0
   for id in $(ts_api GET "/tailnet/-/devices?tags=$TS_TAG" | jq -r --arg tag "$TS_TAG" --arg prefix "$1" \
     '.devices[]? | select((.tags // []) | index($tag)) | select(.hostname | startswith($prefix)) | .id'); do
-    if ts_api DELETE "/device/$id" >/dev/null; then
+    if ts_api DELETE "/device/$id" >/dev/null || { sleep 1 && ts_api DELETE "/device/$id" >/dev/null; }; then
       log "removed tailnet device $id"
     fi
   done
@@ -155,10 +155,13 @@ enabled_regions() {
 }
 
 scan_region() {
-  local region=$1 instances sg subnets rtbs cagws
+  local region=$1 instances dying sg subnets rtbs cagws
   instances=$(aws_ ec2 describe-instances --region "$region" \
     --filters Name=tag-key,Values=hop Name=instance-state-name,Values=pending,running \
     --query 'Reservations[].Instances[].{id:InstanceId,ip:PublicIpAddress||NetworkInterfaces[0].Association.CarrierIp,type:InstanceType,spot:InstanceLifecycle,launched:LaunchTime,zone:Placement.AvailabilityZone,host:Tags[?Key==`hop`]|[0].Value}')
+  dying=$(aws_ ec2 describe-instances --region "$region" \
+    --filters Name=tag-key,Values=hop Name=instance-state-name,Values=shutting-down \
+    --query 'Reservations[].Instances[].InstanceId')
   sg=$(aws_ ec2 describe-security-groups --region "$region" \
     --filters "Name=group-name,Values=$SG_NAME" Name=tag-key,Values=hop \
     --query 'SecurityGroups[0].GroupId' --output text)
@@ -169,10 +172,10 @@ scan_region() {
   cagws=$(aws_ ec2 describe-carrier-gateways --region "$region" \
     --filters Name=tag-key,Values=hop Name=state,Values=pending,available \
     --query 'CarrierGateways[].CarrierGatewayId' 2>/dev/null) || cagws='[]'
-  jq -n --arg region "$region" --arg sg "$sg" --argjson instances "$instances" \
+  jq -n --arg region "$region" --arg sg "$sg" --argjson instances "$instances" --argjson dying "$dying" \
     --argjson subnets "$subnets" --argjson rtbs "$rtbs" --argjson cagws "$cagws" \
     '{region: $region, sg: (if $sg == "None" then null else $sg end), subnets: $subnets, rtbs: $rtbs, cagws: $cagws,
-      instances: $instances}'
+      instances: $instances, dying: $dying}'
 }
 
 scan() {
@@ -476,8 +479,9 @@ delete_each() {
 }
 
 destroy_region() {
-  local region=$1 entry=$2 ids hosts host sg
+  local region=$1 entry=$2 ids hosts host sg dying
   ids=$(jq -r '.instances[].id' <<<"$entry")
+  dying=$(jq -r '.dying[]' <<<"$entry")
   hosts=$(jq -r '.instances[].host' <<<"$entry")
   sg=$(jq -r '.sg // empty' <<<"$entry")
   for host in $hosts; do
@@ -489,7 +493,9 @@ destroy_region() {
     for host in $hosts; do
       ts_delete_devices "$host"
     done
-    aws_ ec2 wait instance-terminated --region "$region" --instance-ids $ids
+  fi
+  if [[ -n $ids$dying ]]; then
+    aws_ ec2 wait instance-terminated --region "$region" --instance-ids $ids $dying
   fi
   delete_each "$region" "$entry" subnets subnet subnet-id
   delete_each "$region" "$entry" rtbs route-table route-table-id
@@ -552,7 +558,7 @@ abandon() {
   local region=$1 host=$2
   destroy_region "$region" "$(scan_region "$region" | jq -c --arg host "$host" '
     if any(.instances[]; .host != $host)
-    then {region, sg: null, subnets: [], rtbs: [], cagws: [], instances: [.instances[] | select(.host == $host)]}
+    then {region, sg: null, subnets: [], rtbs: [], cagws: [], dying: [], instances: [.instances[] | select(.host == $host)]}
     else . end')"
 }
 

@@ -28,6 +28,8 @@ case "$3 $4" in
   "ec2 describe-instances")
     if [[ $* == *--instance-ids* ]]; then
       echo 203.0.113.7
+    elif [[ $* == *shutting-down* ]]; then
+      if [[ -f $STATE/dying && $region == eu-west-2 ]]; then echo '["i-dying"]'; else echo '[]'; fi
     elif [[ -f $STATE/instance && $region == "$(cut -d' ' -f1 "$STATE/instance")" ]]; then
       jq -n --arg zone "$(cut -d' ' -f2 "$STATE/instance")" --arg host "$(cut -d' ' -f3 "$STATE/instance")" \
         '[{id: "i-abc", ip: "203.0.113.7", type: "t4g.micro", launched: "2026-10-02T12:00:00+00:00", zone: $zone, host: $host}]'
@@ -464,6 +466,12 @@ touch "$STATE/denied"
 refute "a launch AWS will not authorize fails" "$ROOT/hop" up eu-west-2
 expect "a launch AWS will not authorize is tried once" test "$(count run-instances)" = 1
 expect "a launch AWS will not authorize leaves no security group" test ! -e "$STATE/sg"
+
+reset
+touch "$STATE/dying" "$STATE/sg"
+"$ROOT/hop" down eu-west-2 >/dev/null 2>&1
+expect "down waits for a node that is still shutting down before deleting its security group" called "wait instance-terminated --region eu-west-2 --instance-ids i-dying"
+expect "down then deletes the security group" test ! -e "$STATE/sg"
 
 reset
 refute "a missing AWS profile is an error" env -u HOP_AWS_PROFILE "$ROOT/hop" regions
