@@ -330,6 +330,12 @@ refute "a refused --spot mints no auth key" called "tailnet/-/keys"
 refute "a refused --spot launches nothing" called "run-instances"
 
 reset
+"$ROOT/hop" down us-gov-west-1 >/dev/null 2>&1
+expect "a region with a four-part name is not taken for a zone" called "describe-instances --region us-gov-west-1"
+"$ROOT/hop" down us-gov-west-1-xyz-1a >/dev/null 2>&1
+refute "a zone of such a region resolves to it" called "--region us-gov-west "
+
+reset
 refute "a missing AWS profile is an error" env -u HOP_AWS_PROFILE "$ROOT/hop" regions
 expect "doctor passes with everything in place" "$ROOT/hop" doctor
 expect "doctor revokes its test key" called "-X DELETE"

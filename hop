@@ -132,12 +132,12 @@ ts_release() {
 }
 
 is_zone() {
-  [[ $1 == *-*-*-* ]]
+  [[ $1 =~ ^([a-z]+(-[a-z]+)+-[0-9]+)-. ]]
 }
 
 region_of() {
   if is_zone "$1"; then
-    cut -d- -f1-3 <<<"$1"
+    echo "${BASH_REMATCH[1]}"
   else
     echo "$1"
   fi
@@ -526,7 +526,7 @@ cmd_up() {
   ts_login
 
   existing=$(scan_region "$region" | jq -c --arg zone "$zone" \
-    '[.instances[] | select(if $zone == "" then (.zone | test("^[a-z]+-[a-z]+-[0-9]+[a-z]$")) else .zone == $zone end)][0] // empty')
+    '[.instances[] | select(if $zone == "" then (.zone | test("^[a-z]+(-[a-z]+)+-[0-9]+[a-z]$")) else .zone == $zone end)][0] // empty')
   if [[ -n $existing ]]; then
     host=$(jq -r .host <<<"$existing")
     id=$(jq -r .id <<<"$existing")
