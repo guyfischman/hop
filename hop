@@ -188,7 +188,7 @@ scan() {
 default_vpc() {
   local vpc
   vpc=$(aws_ ec2 describe-vpcs --region "$1" --filters Name=is-default,Values=true \
-    --query 'Vpcs[0].[VpcId,CidrBlock]' --output text)
+    --query 'Vpcs[0].[VpcId,CidrBlock]' --output text) || exit 1
   [[ $vpc != None* ]] ||
     die "$1 has no default VPC; create one with: aws --profile $HOP_AWS_PROFILE ec2 create-default-vpc --region $1"
   echo "$vpc"
@@ -199,9 +199,11 @@ ensure_zone() {
   read -r status group ZONE_TYPE <<<"$(aws_ ec2 describe-availability-zones --region "$region" --all-availability-zones \
     --filters "Name=zone-name,Values=$zone" Name=zone-type,Values=local-zone,wavelength-zone \
     --query 'AvailabilityZones[0].[OptInStatus,GroupName,ZoneType]' --output text)"
+  [[ -n $status ]] || die "could not look up $zone in $region"
   [[ $status != None ]] || die "$zone is not a Local or Wavelength Zone of $region; see 'hop zones'"
   [[ $status == not-opted-in ]] || return 0
-  aws_ ec2 modify-availability-zone-group --region "$region" --group-name "$group" --opt-in-status opted-in >/dev/null
+  aws_ ec2 modify-availability-zone-group --region "$region" --group-name "$group" --opt-in-status opted-in >/dev/null ||
+    die "could not enable zone group $group"
   log "enabled zone group $group on the account; this takes a few minutes the first time"
   while ((waited < ZONE_TIMEOUT)); do
     status=$(aws_ ec2 describe-availability-zones --region "$region" --all-availability-zones \
@@ -217,7 +219,7 @@ ensure_subnet() {
   local region=$1 zone=$2 vpc=$3 cidr=$4 subnet third
   subnet=$(aws_ ec2 describe-subnets --region "$region" \
     --filters "Name=availability-zone,Values=$zone" "Name=vpc-id,Values=$vpc" \
-    --query 'Subnets[0].SubnetId' --output text)
+    --query 'Subnets[0].SubnetId' --output text) || exit 1
   if [[ $subnet == None ]]; then
     for third in 255 254 253 252 251 250 249 248; do
       subnet=$(aws_ ec2 create-subnet --region "$region" --vpc-id "$vpc" --availability-zone "$zone" \
@@ -236,37 +238,38 @@ route_via_carrier() {
   local region=$1 vpc=$2 subnet=$3 cagw rtb tries=0
   cagw=$(aws_ ec2 describe-carrier-gateways --region "$region" \
     --filters "Name=vpc-id,Values=$vpc" Name=state,Values=pending,available \
-    --query 'CarrierGateways[0].CarrierGatewayId' --output text)
+    --query 'CarrierGateways[0].CarrierGatewayId' --output text) || exit 1
   if [[ $cagw == None ]]; then
     cagw=$(aws_ ec2 create-carrier-gateway --region "$region" --vpc-id "$vpc" \
       --tag-specifications "ResourceType=carrier-gateway,Tags=[{Key=hop,Value=cagw}]" \
-      --query CarrierGateway.CarrierGatewayId --output text)
+      --query CarrierGateway.CarrierGatewayId --output text) || exit 1
   fi
   rtb=$(aws_ ec2 create-route-table --region "$region" --vpc-id "$vpc" \
     --tag-specifications "ResourceType=route-table,Tags=[{Key=hop,Value=rtb}]" \
-    --query RouteTable.RouteTableId --output text)
+    --query RouteTable.RouteTableId --output text) || exit 1
   until aws_ ec2 create-route --region "$region" --route-table-id "$rtb" \
     --destination-cidr-block 0.0.0.0/0 --carrier-gateway-id "$cagw" >/dev/null 2>&1; do
     tries=$((tries + 1))
     ((tries < 12)) || die "could not route $subnet through carrier gateway $cagw"
     sleep "$POLL_INTERVAL"
   done
-  aws_ ec2 associate-route-table --region "$region" --route-table-id "$rtb" --subnet-id "$subnet" >/dev/null
+  aws_ ec2 associate-route-table --region "$region" --route-table-id "$rtb" --subnet-id "$subnet" >/dev/null ||
+    die "could not attach route table $rtb to $subnet"
 }
 
 ensure_sg() {
   local region=$1 vpc=$2 sg
   sg=$(aws_ ec2 describe-security-groups --region "$region" \
     --filters "Name=group-name,Values=$SG_NAME" "Name=vpc-id,Values=$vpc" \
-    --query 'SecurityGroups[0].GroupId' --output text)
+    --query 'SecurityGroups[0].GroupId' --output text) || exit 1
   if [[ $sg == None ]]; then
     sg=$(aws_ ec2 create-security-group --region "$region" --group-name "$SG_NAME" --vpc-id "$vpc" \
       --description "hop exit node" \
       --tag-specifications "ResourceType=security-group,Tags=[{Key=hop,Value=sg}]" \
-      --query GroupId --output text)
+      --query GroupId --output text) || exit 1
     aws_ ec2 authorize-security-group-ingress --region "$region" --group-id "$sg" \
       --ip-permissions "IpProtocol=udp,FromPort=$WG_PORT,ToPort=$WG_PORT,IpRanges=[{CidrIp=0.0.0.0/0}],Ipv6Ranges=[{CidrIpv6=::/0}]" \
-      >/dev/null
+      >/dev/null || exit 1
   fi
   echo "$sg"
 }
@@ -306,17 +309,17 @@ pick_types() {
   local region=$1 zone=$2 spot=$3 offered specs prices
   if [[ -n $zone ]]; then
     offered=$(aws_ ec2 describe-instance-type-offerings --region "$region" --location-type availability-zone \
-      --filters "Name=location,Values=$zone" --query 'InstanceTypeOfferings[].InstanceType')
+      --filters "Name=location,Values=$zone" --query 'InstanceTypeOfferings[].InstanceType') || exit 1
   else
     offered=$(aws_ ec2 describe-instance-type-offerings --region "$region" \
-      --query 'InstanceTypeOfferings[].InstanceType')
+      --query 'InstanceTypeOfferings[].InstanceType') || exit 1
   fi
   specs=$(aws_ ec2 describe-instance-types --region "$region" \
     --filters Name=hypervisor,Values=nitro Name=bare-metal,Values=false \
     Name=processor-info.supported-architecture,Values=arm64,x86_64 \
-    --query 'InstanceTypes[].{type:InstanceType,memory:MemoryInfo.SizeInMiB,archs:ProcessorInfo.SupportedArchitectures}')
+    --query 'InstanceTypes[].{type:InstanceType,memory:MemoryInfo.SizeInMiB,archs:ProcessorInfo.SupportedArchitectures}') || exit 1
   if ((spot)); then
-    prices=$(spot_prices "$region" "$zone")
+    prices=$(spot_prices "$region" "$zone") || exit 1
     [[ $prices != '[]' ]] || die "${zone:-$region} has no spot prices; launch without --spot"
   else
     prices=$(hourly_prices "${zone:-$region}" 2>/dev/null) || prices='[]'
@@ -363,14 +366,14 @@ launch() {
   local region=$1 ttl=$2 host=$3 zone=$4 spot=$5 sg spec specs type arch usd az key file id='' vpc cidr subnet
   local placement address market
   [[ -z $zone ]] || ensure_zone "$region" "$zone"
-  specs=$(pick_types "$region" "$zone" "$spot")
+  specs=$(pick_types "$region" "$zone" "$spot") || exit 1
   key=$(ts_mint_key | jq -r '.key // empty') || true
   [[ -n $key ]] || die "Tailscale returned no auth key; check the OAuth client has the auth_keys scope and $TS_TAG"
-  spec=$(default_vpc "$region")
+  spec=$(default_vpc "$region") || exit 1
   read -r vpc cidr <<<"$spec"
-  sg=$(ensure_sg "$region" "$vpc")
+  sg=$(ensure_sg "$region" "$vpc") || exit 1
   if [[ -n $zone ]]; then
-    subnet=$(ensure_subnet "$region" "$zone" "$vpc" "$cidr")
+    subnet=$(ensure_subnet "$region" "$zone" "$vpc" "$cidr") || exit 1
     address=AssociatePublicIpAddress
     [[ $ZONE_TYPE != wavelength-zone ]] || address=AssociateCarrierIpAddress
     placement=(--network-interfaces "DeviceIndex=0,SubnetId=$subnet,Groups=$sg,$address=true"

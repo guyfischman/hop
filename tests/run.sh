@@ -37,7 +37,9 @@ case "$3 $4" in
   "ec2 describe-security-groups")
     if [[ -f $STATE/sg ]]; then echo sg-123; else echo None; fi
     ;;
-  "ec2 describe-vpcs") printf 'vpc-1\t172.31.0.0/16\n' ;;
+  "ec2 describe-vpcs")
+    if [[ -f $STATE/novpc ]]; then echo None; else printf 'vpc-1\t172.31.0.0/16\n'; fi
+    ;;
   "ec2 describe-subnets")
     if [[ $* == *tag-key* ]]; then
       if [[ -f $STATE/subnet && $region == us-east-1 ]]; then echo '["subnet-z"]'; else echo '[]'; fi
@@ -312,6 +314,19 @@ reset
 refute "a failed up beside a running node fails" "$ROOT/hop" up us-east-1-xyz-1a
 refute "a failed up leaves the running node alone" called "terminate-instances"
 expect "a failed up leaves the running node's security group" test -e "$STATE/instance" -a -e "$STATE/sg" -a -e "$STATE/exit"
+
+reset
+touch "$STATE/novpc"
+"$ROOT/hop" up eu-west-2 >/dev/null 2>"$WORK/err"
+expect "a region without a default VPC says how to create one" grep -q create-default-vpc "$WORK/err"
+refute "a region without a default VPC creates no security group" called "create-security-group"
+refute "a region without a default VPC launches nothing" called "run-instances"
+
+reset
+"$ROOT/hop" up us-east-1-bue-1a --spot >/dev/null 2>"$WORK/err"
+expect "--spot in a zone without spot prices is refused" grep -q "no spot prices" "$WORK/err"
+refute "a refused --spot mints no auth key" called "tailnet/-/keys"
+refute "a refused --spot launches nothing" called "run-instances"
 
 reset
 refute "a missing AWS profile is an error" env -u HOP_AWS_PROFILE "$ROOT/hop" regions
