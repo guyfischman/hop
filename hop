@@ -484,6 +484,14 @@ destroy_region() {
   fi
 }
 
+abandon() {
+  local region=$1 host=$2
+  destroy_region "$region" "$(scan_region "$region" | jq -c --arg host "$host" '
+    if any(.instances[]; .host != $host)
+    then {region, sg: null, subnets: [], rtbs: [], cagws: [], instances: [.instances[] | select(.host == $host)]}
+    else . end')"
+}
+
 cmd_up() {
   local place='' ttl=$TTL_HOURS spot=0
   while (($#)); do
@@ -521,13 +529,13 @@ cmd_up() {
   else
     host="hop-$place-$(openssl rand -hex 2)"
     id=$(launch "$region" "$ttl" "$host" "$zone" "$spot") || {
-      destroy_region "$region" "$(scan_region "$region")"
+      abandon "$region" "$host"
       exit 1
     }
   fi
 
   if ! wait_for_join "$region" "$host" "$id"; then
-    [[ -n $existing ]] || destroy_region "$region" "$(scan_region "$region")"
+    [[ -n $existing ]] || abandon "$region" "$host"
     exit 1
   fi
 

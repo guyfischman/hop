@@ -281,6 +281,13 @@ expect "down by zone name cleans the parent region" test ! -e "$STATE/instance" 
 refute "an unknown zone is refused" "$ROOT/hop" up us-east-1-xyz-1a
 
 reset
+"$ROOT/hop" up us-east-1 >/dev/null 2>&1
+: >"$CALLS"
+refute "a failed up beside a running node fails" "$ROOT/hop" up us-east-1-xyz-1a
+refute "a failed up leaves the running node alone" called "terminate-instances"
+expect "a failed up leaves the running node's security group" test -e "$STATE/instance" -a -e "$STATE/sg" -a -e "$STATE/exit"
+
+reset
 refute "a missing AWS profile is an error" env -u HOP_AWS_PROFILE "$ROOT/hop" regions
 expect "doctor passes with everything in place" "$ROOT/hop" doctor
 expect "doctor revokes its test key" called "-X DELETE"
