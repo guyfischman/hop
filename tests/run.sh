@@ -223,6 +223,7 @@ expect "down terminates the instance" called "terminate-instances --region eu-we
 expect "down deletes the tagged tailnet device" called "/device/d1"
 refute "down leaves untagged devices alone" called "/device/d2"
 refute "down leaves other tags alone" called "/device/d3"
+expect "down looks for the security group by tag" called "describe-security-groups --region eu-west-2 --filters Name=group-name,Values=hop Name=tag-key,Values=hop"
 expect "down deletes the security group" called "delete-security-group --region eu-west-2 --group-id sg-123"
 expect "down leaves nothing behind" test ! -e "$STATE/instance" -a ! -e "$STATE/sg" -a ! -e "$STATE/exit"
 expect "status reports nothing running" test "$("$ROOT/hop" status 2>/dev/null)" = "no nodes running"

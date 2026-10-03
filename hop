@@ -152,7 +152,8 @@ scan_region() {
   instances=$(aws_ ec2 describe-instances --region "$region" \
     --filters Name=tag-key,Values=hop Name=instance-state-name,Values=pending,running \
     --query 'Reservations[].Instances[].{id:InstanceId,ip:PublicIpAddress||NetworkInterfaces[0].Association.CarrierIp,type:InstanceType,spot:InstanceLifecycle,launched:LaunchTime,zone:Placement.AvailabilityZone,host:Tags[?Key==`hop`]|[0].Value}')
-  sg=$(aws_ ec2 describe-security-groups --region "$region" --filters "Name=group-name,Values=$SG_NAME" \
+  sg=$(aws_ ec2 describe-security-groups --region "$region" \
+    --filters "Name=group-name,Values=$SG_NAME" Name=tag-key,Values=hop \
     --query 'SecurityGroups[0].GroupId' --output text)
   subnets=$(aws_ ec2 describe-subnets --region "$region" --filters Name=tag-key,Values=hop \
     --query 'Subnets[].SubnetId')
