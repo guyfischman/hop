@@ -15,6 +15,7 @@ stub() {
 stub aws <<'STUB'
 #!/usr/bin/env bash
 echo "aws $*" >>"$CALLS"
+[[ -f $STATE/offline ]] && exit 1
 region=
 args=("$@")
 for ((i = 0; i < $#; i++)); do
@@ -222,6 +223,19 @@ refute "down leaves other tags alone" called "/device/d3"
 expect "down deletes the security group" called "delete-security-group --region eu-west-2 --group-id sg-123"
 expect "down leaves nothing behind" test ! -e "$STATE/instance" -a ! -e "$STATE/sg" -a ! -e "$STATE/exit"
 expect "status reports nothing running" test "$("$ROOT/hop" status 2>/dev/null)" = "no nodes running"
+
+reset
+"$ROOT/hop" up eu-west-2 >/dev/null 2>&1
+touch "$STATE/offline"
+: >"$CALLS"
+"$ROOT/hop" down >/dev/null 2>&1
+expect "down stops routing even when AWS is unreachable" test ! -e "$STATE/exit"
+touch "$STATE/exit"
+"$ROOT/hop" down eu-west-2 >/dev/null 2>&1
+expect "down by place stops routing even when AWS is unreachable" test ! -e "$STATE/exit"
+touch "$STATE/exit"
+"$ROOT/hop" down us-east-1 >/dev/null 2>&1
+expect "down by place keeps routing through a node elsewhere" test -e "$STATE/exit"
 
 reset
 "$ROOT/hop" up eu-west-2 --ttl 2 >/dev/null 2>&1

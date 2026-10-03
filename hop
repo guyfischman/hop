@@ -125,7 +125,7 @@ ts_current_exit() {
 ts_release() {
   local current
   current=$(ts_current_exit)
-  if [[ -n $current && ( $# -eq 0 && $current == hop-* || $current == "${1:-}" ) ]]; then
+  if [[ -n $current && $current == $1 ]]; then
     tailscale set --exit-node=
     log "stopped routing through $current"
   fi
@@ -552,9 +552,10 @@ cmd_down() {
   ts_login || log "hop: no Tailscale API access; Tailscale removes the devices itself once they are offline"
   if (($#)); then
     regions=$(region_of "$1")
+    ts_release "hop-$regions-*"
   else
+    ts_release 'hop-*'
     regions=$(enabled_regions)
-    ts_release
   fi
   scan $regions | jq -c '.[] | select(.sg != null or (.subnets + .rtbs + .cagws + .instances | length > 0))' |
     while read -r entry; do
