@@ -1,46 +1,24 @@
 # hop
 
-An IP address in an AWS region, Local Zone or Wavelength Zone of your choice,
-on demand. `hop up` launches the cheapest throwaway EC2 instance the place
-offers, joins it to your tailnet as an exit node and routes this Mac through
-it; `hop down` removes the instance, everything hop created around it, and
-its tailnet device, along with the devices of nodes that died on their own.
+cli to turn up an ephemeral exit node on your tailnet at an AWS region, Local
+Zone, or Wavelength Zone of your choice.
 
 ```
-hop up eu-west-2            # prints: <hostname> <region> <public ip>
-hop up eu-west-2 --spot     # the same on spare capacity, at the spot price
+hop up [region]             # turns up node and routes your mac through it
+hop up [region] --spot      # spot pricing, interruptible instance
+hop up [region] --ttl 2     # use non-default (8 hours) ttl
+hop up 
 hop status                  # running nodes, and which one is in use; --json for scripts
-hop down                    # destroy every node; or: hop down eu-west-2
+hop down                    # destroy every node
+hop down [region]           # destroy one node
 hop regions                 # regions the AWS account can launch in
 hop zones                   # Local and Wavelength Zones under those regions
-hop up us-east-1-bue-1a     # Buenos Aires (Local Zone)
-hop up ca-central-1-wl1-yto-wlz-1   # Toronto (Wavelength Zone, Bell's network)
 hop doctor                  # check tools, credentials and Tailscale access
 ```
 
-A node destroys itself after 8 hours even if `down` never runs. Change that
-per launch with `--ttl HOURS` or for good with `HOP_TTL_HOURS`.
-
-Tailscale drops all traffic while its exit node is gone, so `hop up` installs
-a watcher as a launch agent (`~/Library/LaunchAgents/hop.watch.plist`). It
-exists only while this Mac routes through a hop node: launchd restarts it if
-it dies and starts it again after a restart of the Mac, and it removes itself
-once the Mac is no longer using a hop node.
-
-The watcher pings the node in use about once a second and fetches a small
-page through it every ten. It switches routing off, so the Mac is back on its
-own connection and its own IP address, when
-
-- two pings in a row go unanswered, because the node expired, was reclaimed
-  or was terminated; this takes two or three seconds;
-- the node answers pings but carries no traffic;
-- the node has left the tailnet.
-
-Before giving a node up for good the watcher checks that the internet is
-reachable without it. If it is not, the fault is this Mac's own network, and
-routing through the node is switched back on; the same happens when the node
-answers again after a stall. When it does give a node up, a notification says
-so and the node's tailnet device is removed.
+A watcher pings the exit node and if down restores the mac's network access.
+This is a convenience script - if you need anonymity and a kill switch then you
+need something else.
 
 ## Requirements
 
@@ -109,59 +87,3 @@ The profile's identity needs these actions.
 
 The region needs a default VPC. Opt-in regions must be enabled on the account
 before `hop regions` lists them.
-
-## What a node is
-
-The cheapest instance the target offers, running the current Amazon Linux
-2023 image, with no key pair, no instance role, IMDSv2 only, and a security
-group that admits UDP 41641 and nothing else. hop keeps
-no state on disk: a node is any instance carrying the `hop` tag.
-
-At launch hop asks AWS which instance types the region or zone offers and
-what each costs per hour right now, and launches the cheapest with at least
-`HOP_MIN_MEMORY_MIB` (default 512). If that launch fails for lack of
-capacity it tries the next cheapest. Nothing about sizes or prices is stored
-in hop. The node adds a swap file before installing Tailscale, because the
-package install does not fit in 0.5 GB of memory on its own.
-
-With `--spot` the ranking uses current spot prices, per availability zone,
-and the node is a one-time spot instance in the cheapest zone. AWS can
-reclaim a spot instance at two minutes' notice; if that happens while this
-Mac is routed through it, the watcher puts the Mac back on its own
-connection. The
-Buenos Aires and Toronto zones have no spot prices, so `--spot` is refused
-there.
-
-If on-demand prices can't be read, hop says so and falls back to the least
-memory.
-
-## Zones
-
-Countries without a full region are often covered by a zone attached to one.
-`hop up <zone>` enables the zone on the account the first time (a few
-minutes), creates a small subnet for it in the parent region's default VPC,
-and `hop down <zone>` removes the subnet again along with every node in that
-parent region. The zone stays enabled on the account.
-
-Zones offer few instance sizes, often nothing below `t3.medium`, and the
-small ones can be out of capacity, so hop moves on to the next cheapest. The
-launch line and `hop status` show the size you got.
-
-`hop up` says whether this Mac reaches the node directly or through one of
-Tailscale's relays. The security group admits Tailscale's UDP port, so a node
-in a region or Local Zone is reached directly unless the network this Mac is
-on blocks UDP.
-
-A Wavelength Zone sits inside a mobile carrier's network. The node reaches
-the internet through a carrier gateway, websites see the carrier's address
-and not an Amazon one, and nothing on the internet can connect in, so
-Tailscale relays the traffic and it is slower than a direct connection.
-
-## Tests
-
-```sh
-tests/run.sh
-```
-
-The suite replaces `aws`, `tailscale`, `curl` and `security` with stubs, so it
-launches nothing and needs no credentials.
